@@ -133,7 +133,7 @@ Se auditaron `leads` y `citas` por el mismo patrón de bug. Resultado: **ambas t
 
 **Nota:** `citas.fecha_inicio` y `citas.fecha_fin` (también `without time zone`) **no se corrigen con este fix** — se escriben directamente desde el razonamiento del agente IA (`$fromAI(...)::timestamp`), no desde `NOW()`. Su corrección depende de que el agente calcule bien la fecha, lo cual está ligado al hallazgo de la sección 10.
 
-`eventos_lead` — no se encontró ningún nodo en `Bot_Agencia_final` que escriba en esta tabla. Pendiente confirmar si se usa desde otro proceso o si es una tabla sin implementar aún.
+`eventos_lead` — no se encontró ningún nodo en `Bot_Agencia_final` que escriba en esta tabla. **Confirmado:** la tabla existe en el esquema (diseñada como log de auditoría genérico: `tipo`, `valor_antes`, `valor_despues`, `origen`, `metadata`, con columnas `WITH time zone` — bien diseñada, sin riesgo del bug de timezone si se llega a usar), pero tiene **0 filas** — nunca se ha escrito en ella. **Decisión:** se deja sin implementar por ahora (Opción B — pendiente intencional), hasta que haya un caso de uso real que justifique conectarla al workflow (por ejemplo, trazabilidad histórica de cambios de estado de un lead para reportería).
 
 ## 10. Hallazgo investigado y descartado: `{fecha_actual}` del system prompt
 
@@ -142,5 +142,5 @@ Se sospechó que `$now.toFormat('dd/MM/yyyy')` (usado para `{fecha_actual}` en `
 ## 11. Pendiente
 
 - ~~Revisar si el mismo problema afecta `leads`, `citas`, `eventos_lead`~~ → Completado, ver sección 9.
-- Confirmar si `eventos_lead` se usa desde algún otro proceso.
+- ~~Confirmar si `eventos_lead` se usa desde algún otro proceso~~ → Confirmado: tabla existe con 0 filas, sin implementar. Decisión: queda pendiente intencional (Opción B), no se conecta hasta tener caso de uso real.
 - ~~Investigar el posible bug de `$now` en `{fecha_actual}`~~ → Investigado y descartado, ver sección 10.
