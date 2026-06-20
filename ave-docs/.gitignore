@@ -1,0 +1,44 @@
+# ============================================
+# AVE - .gitignore
+# ============================================
+
+# NUNCA versionar workflows con credenciales en crudo
+# Versionar solo versiones limpias (sufijo .clean.json)
+workflows/*.raw.json
+workflows/**/*credentials*
+
+# Variables de entorno y secretos
+.env
+.env.*
+*.secret
+*secrets*
+*credentials*
+*.key
+*.pem
+
+# Tokens y API keys sueltos
+**/tokens.txt
+**/api-keys*
+
+# Dependencias
+node_modules/
+__pycache__/
+*.pyc
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# Editores
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+logs/
+
+# Backups locales
+*.bak
+*.backup
+backups/
