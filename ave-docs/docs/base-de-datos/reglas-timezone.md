@@ -135,24 +135,12 @@ Se auditaron `leads` y `citas` por el mismo patrón de bug. Resultado: **ambas t
 
 `eventos_lead` — no se encontró ningún nodo en `Bot_Agencia_final` que escriba en esta tabla. Pendiente confirmar si se usa desde otro proceso o si es una tabla sin implementar aún.
 
-## 10. Hallazgo relacionado: posible bug en `{fecha_actual}` del system prompt
+## 10. Hallazgo investigado y descartado: `{fecha_actual}` del system prompt
 
-El `system_prompt` de cada empresa reemplaza el placeholder `{fecha_actual}` así:
-```javascript
-.replace('{fecha_actual}', $now.toFormat('dd/MM/yyyy'))
-```
-
-`$now` en n8n usa la zona horaria **global configurada en la instancia de n8n** (no la del Postgres). Si esa configuración global está en UTC (probable, dado que el resto de la infraestructura lo está), entre las **7pm y medianoche hora Bogotá** el agente recibiría la fecha del día **siguiente** como "hoy" — pudiendo calcular mal fechas relativas como "mañana" al agendar citas en ese rango horario.
-
-**Estado:** detectado, sin confirmar ni corregir todavía. **Cómo verificar:** preguntarle al bot "¿qué fecha es hoy?" en horario nocturno (después de 7pm Bogotá) y comparar contra la fecha real.
-
-**Fix propuesto (pendiente de validar):**
-```javascript
-.replace('{fecha_actual}', $now.setZone('America/Bogota').toFormat('dd/MM/yyyy'))
-```
+Se sospechó que `$now.toFormat('dd/MM/yyyy')` (usado para `{fecha_actual}` en `AI_Agent_Principal`) pudiera estar en UTC, igual que el resto de la infraestructura. **Verificado y descartado:** se probó `$now` directamente en un nodo de prueba y coincidió exactamente con la hora real de Bogotá. La instancia de n8n tiene su propia configuración de zona horaria, independiente del SO del contenedor y de la sesión de Postgres, y está correctamente puesta en `America/Bogota`. Ver detalle en [Bug 10](../troubleshooting/bugs-resueltos.md#bug-10-descartado-tras-verificación-now-en-fecha_actual--sospecha-de-utc).
 
 ## 11. Pendiente
 
 - ~~Revisar si el mismo problema afecta `leads`, `citas`, `eventos_lead`~~ → Completado, ver sección 9.
 - Confirmar si `eventos_lead` se usa desde algún otro proceso.
-- Investigar y corregir el posible bug de `$now` en `{fecha_actual}` (sección 10).
+- ~~Investigar el posible bug de `$now` en `{fecha_actual}`~~ → Investigado y descartado, ver sección 10.

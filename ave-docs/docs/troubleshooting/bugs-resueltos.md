@@ -166,19 +166,14 @@ WHERE id = [ID afectado];
 
 ---
 
-## Bug 10 (sin confirmar): `$now` en `{fecha_actual}` podría estar en UTC
+## Bug 10 (DESCARTADO tras verificación): `$now` en `{fecha_actual}` — sospecha de UTC
 
-**Estado:** detectado durante auditoría, **pendiente de confirmar y corregir**.
+**Estado:** Investigado y **descartado**. `$now` en esta instancia de n8n está correctamente configurado en hora de Bogotá, de forma independiente al resto de la infraestructura.
 
-**Hipótesis:** `AI_Agent_Principal` arma el placeholder `{fecha_actual}` del system prompt con `$now.toFormat('dd/MM/yyyy')` — esto usa la zona horaria global de la instancia de n8n, no la de Postgres. Como el resto de la infraestructura corre en UTC, es probable que `$now` también lo esté.
+**Hipótesis original:** `AI_Agent_Principal` arma el placeholder `{fecha_actual}` del system prompt con `$now.toFormat('dd/MM/yyyy')`. Como el sistema operativo del contenedor y la sesión de Postgres usada por n8n están en UTC, se sospechó que `$now` también podría estarlo, causando errores de un día completo en horario nocturno (7pm-medianoche Bogotá).
 
-**Riesgo si se confirma:** entre las 7pm y medianoche hora Bogotá, el agente recibiría como "hoy" la fecha del día siguiente (porque ya sería ese día en UTC). Esto podría hacer que calcule mal fechas relativas ("mañana", "la próxima semana") al agendar citas en ese horario — un error de un día completo en la cita real, distinto a los bugs de timestamps de auditoría vistos arriba.
+**Verificación realizada:** se agregó un nodo `Edit Fields` de prueba con `{{ $now.toFormat('dd/MM/yyyy HH:mm:ss') }}` y se comparó contra la hora real del reloj. Resultado: `$now` devolvió `10:48:50` cuando la hora real era `10:50` — coincide, sin desfase.
 
-**Cómo confirmar:** preguntarle al bot "¿qué fecha es hoy?" en horario nocturno (después de las 7pm Bogotá) y comparar contra la fecha real.
+**Conclusión:** `$now` tiene su propia configuración de zona horaria a nivel de instancia de n8n (separada del SO del contenedor y de la sesión de Postgres), y en este caso está correctamente puesta en `America/Bogota`. No requiere ninguna corrección.
 
-**Fix propuesto (no aplicado, pendiente de validar):**
-```javascript
-.replace('{fecha_actual}', $now.setZone('America/Bogota').toFormat('dd/MM/yyyy'))
-```
-
-**Lección:** no todos los timestamps de la plataforma pasan por Postgres — `$now` de n8n es una fuente de tiempo independiente con su propia configuración de zona horaria, y puede tener el mismo tipo de bug por una causa distinta.
+**Lección:** no asumir que todas las fuentes de tiempo de una plataforma comparten la misma configuración de zona horaria solo porque corren en la misma infraestructura. n8n, Postgres (vía sesión) y el sistema operativo pueden tener cada uno su propia configuración independiente — verificar cada una por separado antes de intervenir.
