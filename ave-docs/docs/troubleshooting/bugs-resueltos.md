@@ -139,3 +139,46 @@ WHERE empresa_id = 1 AND chatwoot_conversation_id != [el que sí existe];
 **Solución:** Limpiar cookies del dominio de Chatwoot, o recargar con `Ctrl + Shift + R`, o cerrar y reabrir sesión.
 
 **Lección:** Si algo falla solo en el navegador normal pero funciona en incógnito, es caché/cookies, no el sistema.
+
+---
+
+## Bug 9: Recurrencia del bug de timezone tras reconstrucción del workflow
+
+**Síntoma:** Los recordatorios de una prueba nocturna llegaron ~5 horas tarde (esperados ~21:25 y ~21:55, llegaron a las 02:25 y 03:00) — el mismo síntoma del [Bug 5](#bug-5-desfase-de-zona-horaria-en-comparaciones-de-tiempo), que ya se había resuelto en una sesión anterior.
+
+**Causa raíz:** Al reconstruir `Bot_Agencia_final` para resolver el [Bug 4 (memoria)](#bug-4-error-de-memoria-key-parameter-is-empty), los tres nodos que escriben timestamps (`PG_upsert_conversacion`, `PG_actualizar_conversacion`, `PG_actualizar_conversacion_directo`) volvieron a quedar con `NOW()` puro, sin `AT TIME ZONE 'America/Bogota'`. El fix de timezone se había aplicado y validado correctamente en una sesión previa, pero **no se confirmó que siguiera persistiendo** después de la siguiente ronda de cambios sobre el mismo workflow.
+
+**Verificación que destapó el problema:** comparar directamente el query mostrado en el **editor de n8n en producción** (no un archivo exportado previamente) contra lo esperado. El archivo exportado que se tenía como referencia mostraba el fix correcto, pero lo que realmente corría en producción no lo tenía — confirmando que la fuente de verdad es siempre el editor en vivo, no un export anterior.
+
+**Solución:**
+1. Reaplicar `NOW()` → `NOW() AT TIME ZONE 'America/Bogota'` en los 3 nodos, verificando cada uno directamente en el editor de n8n.
+2. Corregir los datos ya contaminados de la fila afectada:
+```sql
+UPDATE conversaciones
+SET
+  ultimo_mensaje_usuario_at = ultimo_mensaje_usuario_at - INTERVAL '5 hours',
+  updated_at = updated_at - INTERVAL '5 hours'
+WHERE id = [ID afectado];
+```
+3. Validar con un mensaje real nuevo que `ultimo_mensaje_usuario_at` quede a segundos de `NOW() AT TIME ZONE 'America/Bogota'`.
+
+**Lección crítica:** Un fix aplicado y validado en una sesión puede perderse silenciosamente si el workflow se reconstruye o reimporta después por otro motivo (en este caso, arreglar un bug no relacionado). **Después de cualquier cambio en n8n, verificar inmediatamente contra el editor en vivo** — nunca asumir que un archivo exportado previamente sigue reflejando el estado real de producción. Ante cualquier bug que "ya se había resuelto antes", lo primero es confirmar en el editor en vivo si el fix sigue presente, antes de re-diagnosticar desde cero.
+
+---
+
+## Bug 10 (sin confirmar): `$now` en `{fecha_actual}` podría estar en UTC
+
+**Estado:** detectado durante auditoría, **pendiente de confirmar y corregir**.
+
+**Hipótesis:** `AI_Agent_Principal` arma el placeholder `{fecha_actual}` del system prompt con `$now.toFormat('dd/MM/yyyy')` — esto usa la zona horaria global de la instancia de n8n, no la de Postgres. Como el resto de la infraestructura corre en UTC, es probable que `$now` también lo esté.
+
+**Riesgo si se confirma:** entre las 7pm y medianoche hora Bogotá, el agente recibiría como "hoy" la fecha del día siguiente (porque ya sería ese día en UTC). Esto podría hacer que calcule mal fechas relativas ("mañana", "la próxima semana") al agendar citas en ese horario — un error de un día completo en la cita real, distinto a los bugs de timestamps de auditoría vistos arriba.
+
+**Cómo confirmar:** preguntarle al bot "¿qué fecha es hoy?" en horario nocturno (después de las 7pm Bogotá) y comparar contra la fecha real.
+
+**Fix propuesto (no aplicado, pendiente de validar):**
+```javascript
+.replace('{fecha_actual}', $now.setZone('America/Bogota').toFormat('dd/MM/yyyy'))
+```
+
+**Lección:** no todos los timestamps de la plataforma pasan por Postgres — `$now` de n8n es una fuente de tiempo independiente con su propia configuración de zona horaria, y puede tener el mismo tipo de bug por una causa distinta.
