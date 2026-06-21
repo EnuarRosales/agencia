@@ -39,9 +39,9 @@ Características:
 
 ### 1.3 Etiquetas fijas del sistema
 
-Un tercer tipo, descubierto al construir la sincronización de etiquetas al contacto (sección 5.1): etiquetas que **no son configurables por el usuario ni dependen de ninguna tabla de configuración** — son hechos objetivos que el sistema aplica siempre, de forma fija, cuando ocurre un evento concreto.
+Un tercer tipo, descubierto al construir la sincronización de etiquetas al contacto (sección 5.1): etiquetas que **no son configurables por el usuario ni dependen de ninguna tabla de configuración** — son hechos que el sistema aplica siempre, de forma fija, cuando ocurre un evento concreto, pero que igual reflejan el **estado actual** de la conversación (no un historial permanente).
 
-Ejemplo: `agendado`. Se aplica automáticamente cuando `registrar_cita_pg` confirma que una cita quedó guardada en la base de datos. No es una regla de negocio que varíe por empresa ni que se pueda activar/desactivar desde Appsmith — es un hecho: o el lead agendó, o no agendó.
+Ejemplo: `agendado`. Se aplica automáticamente cuando `registrar_cita_pg` confirma que una cita quedó guardada en la base de datos. No es una regla de negocio que varíe por empresa ni que se pueda activar/desactivar desde Appsmith.
 
 **Diferencias clave frente a las etiquetas operativas (configurables):**
 
@@ -49,14 +49,14 @@ Ejemplo: `agendado`. Se aplica automáticamente cuando `registrar_cita_pg` confi
 |---|---|---|
 | ¿Dónde se define? | Tabla `etiquetas_operativas`, editable desde Appsmith | Hardcodeada en el query (es un hecho, no una regla) |
 | ¿Varía por empresa? | Sí — cada empresa decide qué etiquetas y qué acciones | No — el hecho es el mismo para todas |
-| ¿Se puede activar/desactivar? | Sí, vía columna `activo` | No aplica — el hecho ocurrió o no ocurrió |
-| Comportamiento al sincronizar al contacto | Se **reemplaza**: si deja de estar presente en la conversación, se quita del contacto | Se **acumula permanentemente**: una vez ocurrido el hecho, queda para siempre en el contacto |
+| ¿Se puede activar/desactivar? | Sí, vía columna `activo` | No aplica — el evento ocurre o no ocurre |
+| Comportamiento al sincronizar al contacto | Se **reemplaza**: si deja de estar presente en la conversación, se quita del contacto | También se **reemplaza** (decisión 2026-06-21): si se quita manualmente de la conversación, se quita también del contacto |
 
-**Por qué el comportamiento de sincronización es distinto:** una etiqueta operativa configurable representa un **estado actual** ("¿debe estar desactivado el bot ahora mismo?") — si cambia, el contacto debe reflejar el estado nuevo, no el viejo. Una etiqueta de sistema representa un **hecho histórico** ("¿alguna vez agendó este lead?") — sigue siendo cierto para siempre, independientemente del estado actual de la conversación. Por eso `agendado` nunca se filtra ni se quita del contacto, a diferencia de `desactivar_bot` (que sí se quita si la conversación se reactiva).
+**Decisión de diseño (revisada):** inicialmente se diseñó `agendado` como permanente (una vez aplicada, quedaría para siempre en el contacto, representando "este lead alguna vez agendó"). Tras pruebas, se decidió que el contacto debe reflejar el **estado actual** de la conversación en todo momento — si `agendado` se quita manualmente de la conversación, también debe desaparecer del contacto. Esto unifica el comportamiento con las etiquetas operativas: todo lo que se sincroniza al contacto representa el estado presente, no un historial acumulado.
 
-**Regla de diseño:** antes de agregar una nueva etiqueta a cualquier mecanismo de sincronización, preguntarse: ¿es una regla de negocio que el cliente podría querer cambiar o desactivar? → va en `etiquetas_operativas`. ¿Es un hecho fijo del sistema, igual para todas las empresas? → va como etiqueta de sistema, hardcodeada en el query, y se trata como permanente al sincronizar.
+**Regla de diseño para clasificar una etiqueta nueva:** ¿es una regla de negocio que el cliente podría querer cambiar o desactivar (qué etiquetas disparan qué acción)? → va en `etiquetas_operativas`. ¿Es un evento fijo del sistema, igual para todas las empresas, que no depende de configuración? → va como etiqueta de sistema, hardcodeada en el query. En ambos casos, el contacto siempre refleja el estado **actual**.
 
-**Implementación actual:** `agendado` es, por ahora, la única etiqueta de este tipo. Se detecta en `PG_get_pipeline_y_operativas_lead` con un `CASE WHEN 'agendado' = ANY(c.etiquetas)...` dedicado, devuelto como `sistema_presentes`, y se agrega (nunca se filtra) en `POST_sincronizar_labels_contacto_cada_turno`. Si en el futuro aparecen más etiquetas de este tipo, vale la pena generalizar este patrón (hoy es una sola, escrita a mano; con 2-3 más convendría un array fijo en vez de un `CASE` por cada una).
+**Implementación actual:** `agendado` es, por ahora, la única etiqueta de este tipo. Se detecta en `PG_get_pipeline_y_operativas_lead` con un `CASE WHEN 'agendado' = ANY(c.etiquetas)...` dedicado, devuelto como `sistema_presentes`, y se filtra/re-agrega en `POST_sincronizar_labels_contacto_cada_turno` igual que las demás categorías. Si en el futuro aparecen más etiquetas de este tipo, vale la pena generalizar este patrón (hoy es una sola, escrita a mano; con 2-3 más convendría un array fijo en vez de un `CASE` por cada una).
 
 `compra-realizada` **no se usa** actualmente en agencIA (existía en el flujo viejo hardcodeado, pero no hay confirmación de que `registrar_pedido` aplique ninguna etiqueta al completarse una compra) — no se agregó como etiqueta de sistema por ahora.
 
