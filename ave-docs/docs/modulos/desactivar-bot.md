@@ -1,6 +1,6 @@
-# Módulo: Sincronización `desactivar_bot` (en progreso)
+# Módulo: Sincronización `desactivar_bot` y etiquetas de contacto
 
-**Estado:** Diseño implementado y validado. Bug original (y su causa real: duplicación en dos caminos paralelos) resuelto y confirmado con prueba de regresión limpia. Quedan pendientes secundarios (ver sección 7).
+**Estado:** Diseño implementado y validado completamente. Bug original (duplicación en dos caminos paralelos) resuelto. Sincronización de pipeline al contacto construida, depurada (condición de carrera) y validada en producción. Rama vieja redundante retirada limpiamente. Quedan pendientes secundarios (ver sección 7).
 
 ---
 
@@ -207,7 +207,7 @@ AND c.chatwoot_conversation_id = {{ $('Contexto').item.json.conversation_id }};
 
 **Validado:** prueba en tiempo real — cambio de etapa del clasificador reflejado en el contacto de Chatwoot en el mismo turno, sin desfase.
 
-**Pendiente:** `POST_sincronizar_etiquetas_contacto` (Rama de `desactivar_bot`) queda intacto por ahora, en desuso de facto para el propósito de campañas — evaluar si retirarlo en una sesión futura, una vez confirmado que el nuevo punto cubre completamente su función.
+**Retiro del nodo viejo (completado):** confirmado que `POST_sincronizar_etiquetas_contacto` era completamente redundante — su única cobertura adicional (`compra-realizada`) ya queda cubierta indirectamente, porque una compra eventualmente lleva a la etiqueta de pipeline `exitoso`, que sí se sincroniza con el nuevo mecanismo. Se eliminaron `GET_etiquetas_contacto` y `POST_sincronizar_etiquetas_contacto` por completo del workflow. `POST_sincronizar_desactivar_bot_chatwoot` (que antes alimentaba la rama vieja) quedó como nodo terminal — su propósito de sincronizar `desactivar_bot`/`en_seguimiento` a nivel de conversación sigue intacto y se valida correctamente como doble factor de revisión, condicionado por `If_debe_desactivar_bot`. Validado con prueba completa en producción tras el retiro.
 
 ### 5.2 Administración desde Appsmith
 
@@ -278,6 +278,7 @@ La cadena `get_estado_conversacion → GET_etiquetas_actuales → PG_check_desac
 
 | Fecha | Versión | Cambio | Autor |
 |---|---|---|---|
+| 2026-06-20 | 1.1 | **Sincronización de pipeline al contacto completada.** Construido punto único de sincronización (`PG_get_pipeline_y_operativas_lead` → `GET_labels_contacto_actual` → `POST_sincronizar_labels_contacto_cada_turno`) que corre en cada turno, habilitando segmentación de campañas por etapa de pipeline real. Bug de condición de carrera encontrado y corregido (conexión movida de `actualizar_estado_lead` a `PG_actualizar_estado_lead`, documentado como [Bug 13](../troubleshooting/bugs-resueltos.md#bug-13-condición-de-carrera-por-conectar-una-rama-nueva-al-nodo-con-nombre-engañoso)). Retirada limpiamente la rama vieja redundante (`GET_etiquetas_contacto`, `POST_sincronizar_etiquetas_contacto`). Renombrado `If_clasificar_lead` → `If_debe_desactivar_bot` para reflejar su función real. Validado completo en producción tras el retiro. | Enuar |
 | 2026-06-20 | 1.0 | **Bug resuelto y validado.** Hallazgo clave: existía un segundo camino duplicado (`If_forzar_desactivar_bot`) con el mismo patrón hardcodeado, no detectado en el diagnóstico inicial — explicaba por qué el bug reaparecía pese a haber corregido `If_clasificar_lead`. Eliminados `If_forzar_desactivar_bot`, `desactivar_bot_auto` y `PG_sync_desactivar_bot_auto`; unificado en un solo camino de control vía `PG_check_desactivar_bot`. Prueba de regresión limpia exitosa: conversación agendada con etiqueta `exitoso`, `desactivar_bot` permaneció en `false` correctamente. | Enuar |
 | 2026-06-20 | 0.2 | Implementado y validado parcialmente: tabla `etiquetas_operativas` (con columna `accion`, pensada para alojar tambien la futura migracion de seguimiento), nodo `PG_check_desactivar_bot`, sincronizacion a Chatwoot agregada. Validado el mecanismo configurable con `lead-tibio`. Detectado y documentado el desfase de un turno. | Enuar |
 | 2026-06-20 | 0.1 | Diagnóstico del bug (mezcla de etiquetas operativas y funcionales en `If_clasificar_lead`). Diseño aprobado del doble filtro con tabla configurable. | Enuar |
