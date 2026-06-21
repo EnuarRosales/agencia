@@ -14,6 +14,7 @@ AVE permite que múltiples empresas (clientes) operen cada una su propio agente 
 - **Módulos**
   - [Recordatorios automáticos](docs/modulos/recordatorios.md)
   - [Sistema de seguimiento (en_seguimiento)](docs/modulos/seguimiento.md)
+  - [Sincronización desactivar_bot](docs/modulos/desactivar-bot.md)
 - [Troubleshooting / bugs resueltos](docs/troubleshooting/bugs-resueltos.md)
 - [Onboarding de nuevos clientes](docs/onboarding-clientes.md)
 

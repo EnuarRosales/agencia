@@ -177,3 +177,17 @@ WHERE id = [ID afectado];
 **Conclusión:** `$now` tiene su propia configuración de zona horaria a nivel de instancia de n8n (separada del SO del contenedor y de la sesión de Postgres), y en este caso está correctamente puesta en `America/Bogota`. No requiere ninguna corrección.
 
 **Lección:** no asumir que todas las fuentes de tiempo de una plataforma comparten la misma configuración de zona horaria solo porque corren en la misma infraestructura. n8n, Postgres (vía sesión) y el sistema operativo pueden tener cada uno su propia configuración independiente — verificar cada una por separado antes de intervenir.
+
+---
+
+## Bug 11: `agendado` forzaba `desactivar_bot=true` vía un SEGUNDO camino no detectado
+
+**Síntoma:** Tras corregir `If_clasificar_lead` (que tenía `['compra-realizada', 'agendado', 'desactivar_bot']` hardcodeado, forzando incorrectamente la desactivación al agendar), las pruebas seguían fallando de forma intermitente y aparentemente contradictoria — a veces el bug parecía corregido, a veces reaparecía, sin patrón claro a primera vista.
+
+**Causa raíz:** Existía un **segundo nodo independiente**, `If_forzar_desactivar_bot`, con el mismo patrón hardcodeado (`['compra-realizada', 'agendado'].includes(e)`), en un camino **paralelo y separado** del flujo, que también convergía en el mismo nodo de efecto (`PG_actualizar_estado_lead_directo → PG_actualizar_conversacion_directo`, que fuerza `desactivar_bot = true` de forma incondicional). El diagnóstico inicial encontró y corrigió un solo camino, sin saber que existía una segunda puerta hacia el mismo destino.
+
+**Cómo se destapó:** Un barrido cronológico completo de **todas** las ejecuciones de una conversación de prueba en n8n Executions (no solo la "última" ejecución asumida), revisando nodo por nodo cuál tomaba qué rama, hasta encontrar la ejecución exacta donde `If_forzar_desactivar_bot` tomó la rama verdadera.
+
+**Solución:** Eliminar la duplicación en vez de parchear ambos `If` por separado — se borró `If_forzar_desactivar_bot` y los nodos que solo él alimentaba (`desactivar_bot_auto`, `PG_sync_desactivar_bot_auto`), dejando un único camino de control hacia el nodo de efecto, vía `If_clasificar_lead` + `PG_check_desactivar_bot` + tabla `etiquetas_operativas` (ver [módulo desactivar-bot](../modulos/desactivar-bot.md)).
+
+**Lección crítica:** Cuando un nodo de efecto (uno que escribe en la base de datos o dispara una acción) puede ser alcanzado desde **más de un camino** en el flujo, corregir la condición de un solo camino de entrada no resuelve el problema — hay que mapear **todas** las puertas de entrada a ese nodo antes de dar un bug por cerrado. Si un fix aplicado correctamente sigue fallando de forma intermitente, es señal de que existe otra ruta no identificada hacia el mismo efecto, no de que el fix esté mal hecho. La forma confiable de encontrarla es el barrido cronológico completo de ejecuciones reales en n8n — no asumir cuál fue "la última" ejecución relevante sin verificarlo.
