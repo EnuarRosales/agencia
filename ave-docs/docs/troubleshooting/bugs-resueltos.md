@@ -191,3 +191,23 @@ WHERE id = [ID afectado];
 **Solución:** Eliminar la duplicación en vez de parchear ambos `If` por separado — se borró `If_forzar_desactivar_bot` y los nodos que solo él alimentaba (`desactivar_bot_auto`, `PG_sync_desactivar_bot_auto`), dejando un único camino de control hacia el nodo de efecto, vía `If_clasificar_lead` + `PG_check_desactivar_bot` + tabla `etiquetas_operativas` (ver [módulo desactivar-bot](../modulos/desactivar-bot.md)).
 
 **Lección crítica:** Cuando un nodo de efecto (uno que escribe en la base de datos o dispara una acción) puede ser alcanzado desde **más de un camino** en el flujo, corregir la condición de un solo camino de entrada no resuelve el problema — hay que mapear **todas** las puertas de entrada a ese nodo antes de dar un bug por cerrado. Si un fix aplicado correctamente sigue fallando de forma intermitente, es señal de que existe otra ruta no identificada hacia el mismo efecto, no de que el fix esté mal hecho. La forma confiable de encontrarla es el barrido cronológico completo de ejecuciones reales en n8n — no asumir cuál fue "la última" ejecución relevante sin verificarlo.
+
+---
+
+## Bug 12: Appsmith — `updatedRow` sin prefijo de tabla causa `affectedRows: 0` silencioso
+
+**Síntoma:** Un query de actualización (`UPDATE`) en una tabla de Appsmith conectada a un widget Table, con `onSave`, se ejecutaba **sin errores** pero nunca persistía los cambios — `affectedRows` siempre devolvía `0`, sin importar qué fila o campo se editara.
+
+**Causa raíz:** El query referenciaba la fila editada como `{{updatedRow.campo}}`, tratándolo como si fuera una variable global del contexto de Appsmith. En realidad, `updatedRow` (igual que `selectedRow`, `processedTableData`, etc.) es una **propiedad específica de cada widget de tabla** — debe referenciarse siempre con el nombre exacto del widget como prefijo: `{{nombreDelWidget.updatedRow.campo}}`. Sin el prefijo, la expresión no resuelve al objeto correcto y el `WHERE id = {{updatedRow.id}}` termina comparando contra un valor vacío/nulo, por lo que el `UPDATE` se ejecuta válidamente pero no encuentra ninguna fila que coincida.
+
+**Cómo se destapó:** Comparación directa contra un query equivalente ya funcional en la misma aplicación (`update_etiqueta`, para una tabla distinta), que sí tenía el prefijo correcto (`{{tbl_etiquetas.updatedRow.id}}`).
+
+**Solución:** Agregar el prefijo del widget en todas las referencias a `updatedRow` dentro del query:
+```sql
+UPDATE etiquetas_operativas SET
+  etiqueta = '{{tbl_etiquetas_oper.updatedRow.etiqueta}}',
+  ...
+WHERE id = {{tbl_etiquetas_oper.updatedRow.id}};
+```
+
+**Lección:** En Appsmith, `affectedRows: 0` sin ningún error visible es la señal característica de este problema — el query es sintácticamente válido pero sus referencias a datos de la fila están mal resueltas. Cuando un query de update "no hace nada" sin fallar, **comparar contra un query equivalente que ya funcione en la misma app** es la forma más rápida de encontrar diferencias de sintaxis como esta, en vez de depurar desde cero.

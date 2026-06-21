@@ -161,6 +161,30 @@ Conectado en paralelo a `GET_etiquetas_contacto` / `POST_sincronizar_etiquetas_c
 
 Durante la implementación se encontró que `POST_sincronizar_etiquetas_contacto` (un nodo preexistente, que sincroniza *labels* — no custom attributes — a nivel de *contacto*, no de conversación) **también** tiene el mismo patrón de etiquetas hardcodeadas: `['compra-realizada','agendado']`. No se tocó en esta sesión para no mezclar cambios en una misma prueba. Queda como hallazgo para una futura revisión, posiblemente aplicando la misma solución de `etiquetas_operativas`.
 
+### 5.2 Administración desde Appsmith
+
+Se agregó una sección en la página **Config Bot** (no en Config Recordatorios) para administrar `etiquetas_operativas`, reutilizando el selector de empresa ya existente en esa página (`sel_empresa_pipeline`), en vez de crear uno nuevo.
+
+**Queries creados:**
+- `get_etiquetas_operativas` — `SELECT ... WHERE empresa_id = {{sel_empresa_pipeline.selectedOptionValue}}`
+- `insert_etiqueta_operativa` — inserta fila nueva para la empresa seleccionada.
+- `update_etiqueta_operativa` — actualiza una fila existente.
+
+**Widget:** tabla `tbl_etiquetas_oper` (nombre truncado por límite de longitud de Appsmith). Columna `accion` configurada como **Select** (no texto libre) con las opciones `desactivar_bot` y `desactivar_seguimiento` — esta última ya preparada para cuando se ejecute la migración de la sección 6.
+
+⚠️ **Bug encontrado y corregido durante la implementación:** el query `update_etiqueta_operativa` daba siempre `affectedRows: 0` — el guardado de ediciones no persistía, aunque no arrojaba ningún error visible. **Causa:** en Appsmith, la propiedad `updatedRow` (que contiene los datos de la fila editada en un evento `onSave`) **debe referenciarse con el nombre del widget de tabla como prefijo** — `{{nombreTabla.updatedRow.campo}}` — no como variable global (`{{updatedRow.campo}}`). El query se había escrito sin ese prefijo. Se corrigió comparando contra el patrón ya funcional de `update_etiqueta` (la tabla equivalente para `etiquetas_pipeline`), que sí usaba `{{tbl_etiquetas.updatedRow.id}}` correctamente.
+
+```sql
+-- Correcto:
+UPDATE etiquetas_operativas SET
+  etiqueta = '{{tbl_etiquetas_oper.updatedRow.etiqueta}}',
+  accion   = '{{tbl_etiquetas_oper.updatedRow.accion}}',
+  activo   = {{tbl_etiquetas_oper.updatedRow.activo}}
+WHERE id = {{tbl_etiquetas_oper.updatedRow.id}};
+```
+
+**Lección:** en Appsmith, `updatedRow` (y de forma similar `selectedRow`) son propiedades específicas de cada widget de tabla, no variables globales del contexto de la página — siempre requieren el prefijo del nombre exacto del widget.
+
 ---
 
 ## 6. Decisión futura relacionada: migrar `es_conversion` a `etiquetas_operativas`
@@ -185,7 +209,7 @@ Discutido pero **no implementado todavía** (queda para un paso separado, según
 - [x] **Identificar y eliminar el segundo camino duplicado** (`If_forzar_desactivar_bot`) — ver sección 4.1.
 - [x] Probar caso de regresión: conversación que agenda → `desactivar_bot` quedó correctamente en `false` (validado desde cero, conversación 1316/145, etiqueta `exitoso` aplicada sin disparar desactivación).
 - [ ] Quitar la fila de prueba `lead-tibio` de `etiquetas_operativas` (sigue desactivada por la prueba de regresión) o reactivarla/decidir su uso definitivo.
-- [ ] Documentar en Appsmith cómo administrar esta tabla (agregar panel similar al de `recordatorio_config`).
+- [x] Documentar en Appsmith cómo administrar esta tabla (agregar panel similar al de `recordatorio_config`) — ver sección 5.2.
 - [ ] **Desfase de un turno en `If_clasificar_lead`** (ver sección 7.1) — decidir si se corrige moviendo la verificación de posición en el flujo, o se deja documentado como limitación aceptada.
 - [ ] Revisar el hallazgo relacionado en `POST_sincronizar_etiquetas_contacto` (sección 5.1) — mismo patrón de etiquetas hardcodeadas, en un nodo distinto.
 - [ ] Ejecutar la migración de `es_conversion` hacia `etiquetas_operativas` (sección 6), una vez auditados todos los caminos de conversión.
