@@ -18,6 +18,7 @@ AVE permite que múltiples empresas (clientes) operen cada una su propio agente 
   - [Sincronización desactivar_bot](docs/modulos/desactivar-bot.md)
 - [Troubleshooting / bugs resueltos](docs/troubleshooting/bugs-resueltos.md)
 - [Onboarding de nuevos clientes](docs/onboarding-clientes.md)
+  - [Guía de integración WhatsApp Business API + Chatwoot](docs/onboarding-clientes/whatsapp-meta-setup.md)
 
 ---
 
