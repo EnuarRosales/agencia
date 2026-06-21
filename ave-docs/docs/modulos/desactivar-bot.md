@@ -119,12 +119,12 @@ CREATE TABLE etiquetas_operativas (
 );
 ```
 
-**Configuración para agencIA** (corrige el bug — `agendado` y `compra-realizada` ya no aparecen; se agregó `lead-tibio` como prueba del mecanismo configurable, validada con éxito):
+**Configuración final para agencIA** (estado definitivo — la fila de prueba `lead-tibio` quedó desactivada permanentemente, sin uso real de negocio):
 
 | empresa_id | etiqueta | accion | activo |
 |---|---|---|---|
 | 1 | desactivar_bot | desactivar_bot | true |
-| 1 | lead-tibio | desactivar_bot | true *(prueba, validada — pendiente decidir si se deja permanente)* |
+| 1 | lead-tibio | desactivar_bot | false *(fue prueba; decisión: no se usa)* |
 
 **Nodo nuevo — `PG_check_desactivar_bot`** (reemplaza la condición JavaScript hardcodeada de `If_clasificar_lead`):
 
@@ -208,7 +208,7 @@ Discutido pero **no implementado todavía** (queda para un paso separado, según
 - [x] Agregar sincronización a Chatwoot (`POST_sincronizar_desactivar_bot_chatwoot`), que faltaba en el camino `PG_actualizar_conversacion_directo`.
 - [x] **Identificar y eliminar el segundo camino duplicado** (`If_forzar_desactivar_bot`) — ver sección 4.1.
 - [x] Probar caso de regresión: conversación que agenda → `desactivar_bot` quedó correctamente en `false` (validado desde cero, conversación 1316/145, etiqueta `exitoso` aplicada sin disparar desactivación).
-- [ ] Quitar la fila de prueba `lead-tibio` de `etiquetas_operativas` (sigue desactivada por la prueba de regresión) o reactivarla/decidir su uso definitivo.
+- [x] Quitar la fila de prueba `lead-tibio` de `etiquetas_operativas` (sigue desactivada por la prueba de regresión) o reactivarla/decidir su uso definitivo. → **Decisión:** desactivada permanentemente (`activo = false`) vía Appsmith. Era solo de prueba, no responde a una necesidad real de negocio de agencIA.
 - [x] Documentar en Appsmith cómo administrar esta tabla (agregar panel similar al de `recordatorio_config`) — ver sección 5.2.
 - [ ] **Desfase de un turno en `If_clasificar_lead`** (ver sección 7.1) — decidir si se corrige moviendo la verificación de posición en el flujo, o se deja documentado como limitación aceptada.
 - [ ] Revisar el hallazgo relacionado en `POST_sincronizar_etiquetas_contacto` (sección 5.1) — mismo patrón de etiquetas hardcodeadas, en un nodo distinto.
