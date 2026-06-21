@@ -6,6 +6,8 @@
 
 ## 1. Concepto clave: tres tipos de etiquetas en AVE
 
+> 📄 Esta sección se generalizó como documento de referencia transversal: ver [Tipos de etiquetas en AVE](../tipos-de-etiquetas.md). Se conserva aquí el resumen aplicado a este módulo específico.
+
 Antes de explicar el módulo, es necesario distinguir las categorías de etiquetas que existen en el sistema y que **no deben mezclarse** — confundir las dos primeras fue la causa raíz del bug documentado en la sección 4.
 
 ### 1.1 Etiquetas funcionales / de calificación

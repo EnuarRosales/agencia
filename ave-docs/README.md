@@ -11,6 +11,7 @@ AVE permite que múltiples empresas (clientes) operen cada una su propio agente 
 - [Arquitectura](docs/arquitectura.md)
 - [Esquema de base de datos](docs/base-de-datos/esquema.md)
 - [Reglas de zona horaria](docs/base-de-datos/reglas-timezone.md)
+- [Tipos de etiquetas en AVE](docs/tipos-de-etiquetas.md)
 - **Módulos**
   - [Recordatorios automáticos](docs/modulos/recordatorios.md)
   - [Sistema de seguimiento (en_seguimiento)](docs/modulos/seguimiento.md)

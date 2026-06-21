@@ -30,7 +30,7 @@ ALTER TABLE conversaciones ADD COLUMN en_seguimiento_activo boolean DEFAULT true
 
 ### 2.2 Custom attribute en Chatwoot
 
-Atributo `en_seguimiento` (tipo checkbox/boolean, nivel conversación). Refleja visualmente el estado en el panel lateral de cada conversación. Se sincroniza con la columna de Postgres.
+Atributo `en_seguimiento` (tipo checkbox/boolean, nivel conversación). Refleja visualmente el estado en el panel lateral de cada conversación. Se sincroniza con la columna de Postgres — aunque, desde la actualización del 2026-06-21 (ver sección 4), la dirección de la sincronización cambió: Chatwoot pasó a ser la fuente de verdad en cada turno, y Postgres se actualiza a partir de ahí (no al revés). Ver [Bug 15](../troubleshooting/bugs-resueltos.md#bug-15-la-tool-del-agente-sincronizaba-a-chatwoot-pero-un-nodo-posterior-sobrescribía-el-valor-con-datos-viejos-de-postgres).
 
 ### 2.3 Mecanismo de conversión (tabla `etiquetas_pipeline`)
 
@@ -73,27 +73,31 @@ La condición usa referencia explícita al nodo:
 
 ### Momento 2 — Mantenimiento (cada turno)
 
-En cada mensaje, el nodo `actualizar_estado_lead` reescribe los custom attributes de Chatwoot. **Debe incluir TODOS los campos**, no solo `estado_lead`, porque la API de Chatwoot reemplaza el objeto completo (ver [bug de custom_attributes](../troubleshooting/bugs-resueltos.md#bug-3-custom-attributes-se-borran-en-cada-turno)).
+**Actualizado 2026-06-21 — mecanismo rediseñado.** En cada mensaje, el nodo `actualizar_estado_lead` reescribe los custom attributes de Chatwoot. **Debe incluir TODOS los campos**, no solo `estado_lead`, porque la API de Chatwoot reemplaza el objeto completo (ver [Bug 3](../troubleshooting/bugs-resueltos.md#bug-3-custom-attributes-se-borran-en-cada-turno)).
 
-Para esto, el nodo `PG_get_conversacion_actual` (nuevo) lee el estado real antes de reescribir:
-```sql
-SELECT en_seguimiento_activo, desactivar_bot
-FROM conversaciones
-WHERE empresa_id = (SELECT id FROM empresas WHERE chatwoot_account_id = {{ $('Contexto').item.json.account_id }} LIMIT 1)
-  AND chatwoot_conversation_id = {{ $('Contexto').item.json.conversation_id }}
-LIMIT 1;
+La versión original de este mecanismo leía el valor "actual" desde **Postgres** (`PG_get_conversacion_actual`) para rellenar `en_seguimiento`/`desactivar_bot` al reescribir. Esto causaba un bug serio (ver [Bug 15](../troubleshooting/bugs-resueltos.md#bug-15-la-tool-del-agente-sincronizaba-a-chatwoot-pero-un-nodo-posterior-sobrescribía-el-valor-con-datos-viejos-de-postgres)): si la tool `desactivar_bot` del agente acababa de cambiar el valor en Chatwoot en ese mismo turno, Postgres todavía no se había enterado, y este nodo **sobrescribía** ese cambio reciente con el dato viejo.
+
+**Solución actual:** en vez de leer Postgres, se lee el estado **real y fresco** directo de Chatwoot justo antes de reescribir — capturando cualquier cambio hecho por la tool del agente en el mismo turno.
+
+```
+AI_Agent_Clasificador → PG_get_conversacion_actual → GET_custom_attributes_fresco
+                                                          ├→ actualizar_estado_lead (usa el valor FRESCO de Chatwoot)
+                                                          └→ PG_sync_estado_real_chatwoot (sincroniza ese valor real a Postgres)
 ```
 
-Y `actualizar_estado_lead` manda el objeto completo:
+`PG_get_conversacion_actual` se conserva en la cadena (otros nodos pueden seguir usándolo), pero `actualizar_estado_lead` ya no toma de ahí los valores de `en_seguimiento`/`desactivar_bot` — los toma de `GET_custom_attributes_fresco`:
+
 ```json
 {
   "custom_attributes": {
     "estado_lead": "{{ $('AI_Agent_Clasificador').item.json.output }}",
-    "en_seguimiento": {{ $('PG_get_conversacion_actual').item.json.en_seguimiento_activo }},
-    "desactivar_bot": {{ $('PG_get_conversacion_actual').item.json.desactivar_bot }}
+    "en_seguimiento": {{ $('GET_custom_attributes_fresco').item.json.custom_attributes.en_seguimiento ?? true }},
+    "desactivar_bot": {{ $('GET_custom_attributes_fresco').item.json.custom_attributes.desactivar_bot || false }}
   }
 }
 ```
+
+`PG_sync_estado_real_chatwoot` cierra el ciclo, sincronizando ese mismo valor fresco hacia `conversaciones.en_seguimiento_activo`/`desactivar_bot` en Postgres — esto es lo que finalmente resolvió la sincronización tool→Postgres que estuvo pendiente desde el diseño original de este módulo.
 
 ### Momento 3 — Apagado (conversión)
 
@@ -134,8 +138,12 @@ WHERE empresa_id = (...) AND chatwoot_conversation_id = {{ $('Contexto').item.js
 
 Cuando un humano toma el control (`desactivar_bot`), también se apaga el seguimiento — no tiene sentido seguir enviando recordatorios automáticos si hay una persona atendiendo.
 
-- **`desactivar_bot_auto`** (rama automática): ya sincronizado vía `PG_sync_desactivar_bot_auto`, que pone `desactivar_bot = true` Y `en_seguimiento_activo = false` en Postgres.
-- **Tool `desactivar_bot`** (invocada por el agente): ⚠️ **PENDIENTE** — esta tool solo escribe en Chatwoot, no sincroniza Postgres todavía. Las tools de un AI Agent no permiten encadenar nodos lineales. Solución recomendada (opción A): leer el custom attribute real de Chatwoot en cada turno y reflejarlo en Postgres. Ver troubleshooting.
+**Estado actual (2026-06-21):** ver el módulo dedicado [Sincronización `desactivar_bot` y etiquetas de contacto](desactivar-bot.md) para el detalle completo. Resumen de los mecanismos que lo apagan:
+
+- **Mecanismo configurable** (`etiquetas_operativas` + `PG_check_desactivar_bot_v2`): cuando una etiqueta configurada para la acción `desactivar_bot` está presente en la conversación, `PG_marcar_desactivar_bot_inmediato` pone `desactivar_bot = true` Y `en_seguimiento_activo = false` en Postgres, en el mismo turno.
+- **Tool `desactivar_bot` del agente:** escribe directo a Chatwoot. Se sincroniza a Postgres vía `PG_sync_estado_real_chatwoot` (ver Momento 2 arriba) — este fue el punto pendiente histórico de este documento, resuelto el 2026-06-21.
+
+Los nodos `desactivar_bot_auto` y `PG_sync_desactivar_bot_auto` mencionados en versiones anteriores de este documento **ya no existen** — fueron retirados al unificar el mecanismo (ver [Bug 11](../troubleshooting/bugs-resueltos.md#bug-11-agendado-forzaba-desactivar_bottrue-vía-un-segundo-camino-no-detectado)).
 
 ---
 
@@ -171,4 +179,5 @@ Esto reemplazó al antiguo `AND c.agendado = false`. Resultado: una conversació
 
 | Fecha | Versión | Cambio | Autor |
 |---|---|---|---|
+| 2026-06-21 | 1.1 | **Pendiente histórico resuelto.** El Momento 2 (mantenimiento) se rediseñó: en vez de leer el valor "actual" desde Postgres (lo que causaba que se sobrescribiera un cambio reciente de la tool `desactivar_bot` — [Bug 15](../troubleshooting/bugs-resueltos.md#bug-15-la-tool-del-agente-sincronizaba-a-chatwoot-pero-un-nodo-posterior-sobrescribía-el-valor-con-datos-viejos-de-postgres)), ahora se lee el estado fresco directo de Chatwoot (`GET_custom_attributes_fresco`) y se sincroniza desde ahí hacia Postgres (`PG_sync_estado_real_chatwoot`). Sección 4 actualizada: los nodos viejos (`desactivar_bot_auto`, `PG_sync_desactivar_bot_auto`) ya no existen, retirados durante el rediseño de `desactivar_bot` documentado en su propio módulo. | Enuar |
 | 2026-06-19 | 1.0 | Implementación inicial del sistema genérico de seguimiento: columna `en_seguimiento_activo`, custom attribute en Chatwoot, apagado automático por `es_conversion`, inicialización en conversación nueva, fix de borrado de custom_attributes, sincronización de `desactivar_bot_auto`. | Enuar |
