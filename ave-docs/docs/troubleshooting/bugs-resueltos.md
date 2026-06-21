@@ -211,3 +211,17 @@ WHERE id = {{tbl_etiquetas_oper.updatedRow.id}};
 ```
 
 **Lección:** En Appsmith, `affectedRows: 0` sin ningún error visible es la señal característica de este problema — el query es sintácticamente válido pero sus referencias a datos de la fila están mal resueltas. Cuando un query de update "no hace nada" sin fallar, **comparar contra un query equivalente que ya funcione en la misma app** es la forma más rápida de encontrar diferencias de sintaxis como esta, en vez de depurar desde cero.
+
+---
+
+## Bug 13: Condición de carrera por conectar una rama nueva al nodo con nombre engañoso
+
+**Síntoma:** Una rama nueva del flujo (sincronización de etiquetas de pipeline al contacto, ver [módulo desactivar-bot](../modulos/desactivar-bot.md)) leía siempre la etiqueta del turno **anterior**, nunca la del turno actual — un mensaje de retraso constante.
+
+**Causa raíz:** La rama nueva se conectó desde `actualizar_estado_lead`, asumiendo por su nombre que ese nodo actualiza el estado del lead en la base de datos. En realidad, `actualizar_estado_lead` es un nodo HTTP que **solo escribe el custom attribute en Chatwoot** — el `UPDATE` real de `leads.estado_lead` en Postgres ocurre en un nodo distinto y posterior en la cadena, `PG_actualizar_estado_lead` (nombre casi idéntico, fácil de confundir). Como la rama nueva arrancaba en paralelo al mismo tiempo que la cadena que llega hasta `PG_actualizar_estado_lead`, la lectura de Postgres ganaba la carrera contra la escritura real, trayendo siempre el valor desactualizado.
+
+**Cómo se destapó:** Inspección directa del nodo `actualizar_estado_lead` en n8n (tipo de nodo y body real) en vez de confiar en el nombre — reveló que era un `httpRequest` hacia Chatwoot, no un nodo Postgres.
+
+**Solución:** Mover el origen de la conexión nueva desde `actualizar_estado_lead` hacia `PG_actualizar_estado_lead` — el nodo que efectivamente termina de escribir el dato en Postgres.
+
+**Lección crítica:** Cuando se conecta una rama nueva a un nodo existente basándose en su nombre, **verificar el tipo de nodo y su contenido real antes de asumir qué hace** — especialmente cuando existen dos nodos con nombres casi idénticos (`actualizar_estado_lead` vs `PG_actualizar_estado_lead`) que sugieren la misma función pero operan sobre sistemas distintos (Chatwoot vs Postgres). Esto refuerza la lección del Bug 11: los nombres de nodos importan, y nombres ambiguos o casi-duplicados son una fuente directa de bugs de timing difíciles de diagnosticar sin inspección directa.

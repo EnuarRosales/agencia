@@ -157,9 +157,57 @@ Conectado en paralelo a `GET_etiquetas_contacto` / `POST_sincronizar_etiquetas_c
 
 ⚠️ **Nota:** inicialmente se intentó incluir `estado_lead` en este body usando `{{ $('AI_Agent_Clasificador').item.json.output }}`, pero causó error (`Node 'AI_Agent_Clasificador' hasn't been executed`) — ese nodo no se ejecuta en todos los caminos que llegan hasta aquí. Se quitó esa referencia; el `estado_lead` se sincroniza en otros puntos del flujo donde sí está disponible.
 
-### 5.1 Hallazgo relacionado (no resuelto, fuera de alcance de este módulo)
+### 5.1 Hallazgo relacionado (resuelto): sincronización del pipeline al contacto
 
-Durante la implementación se encontró que `POST_sincronizar_etiquetas_contacto` (un nodo preexistente, que sincroniza *labels* — no custom attributes — a nivel de *contacto*, no de conversación) **también** tiene el mismo patrón de etiquetas hardcodeadas: `['compra-realizada','agendado']`. No se tocó en esta sesión para no mezclar cambios en una misma prueba. Queda como hallazgo para una futura revisión, posiblemente aplicando la misma solución de `etiquetas_operativas`.
+Durante la implementación se encontró que `POST_sincronizar_etiquetas_contacto` (nodo preexistente, sincroniza *labels* a nivel de *contacto*, no de conversación) tenía el mismo patrón de etiquetas hardcodeadas: `['compra-realizada','agendado']`. Además, vive en la rama de `desactivar_bot` (la que ahora controla `If_debe_desactivar_bot`), por lo que **solo se ejecuta cuando se fuerza la desactivación** — la mayoría de conversaciones nunca pasan por ahí, así que el contacto casi nunca se sincronizaba.
+
+**Objetivo identificado:** poder usar las etiquetas de pipeline del contacto (`lead-frio`/`tibio`/`caliente`/`exitoso`) para segmentar campañas de marketing — cada contacto debe tener **siempre una sola etiqueta de pipeline vigente** (la actual, reemplazando la anterior), no acumulando todas las etapas por las que pasó.
+
+**Solución implementada:** un punto de sincronización nuevo e independiente, que corre en **cada turno** (no condicionado a `desactivar_bot`), agregado en paralelo al flujo existente de calificación:
+
+```
+AI_Agent_Clasificador → ... → actualizar_etiqueta → PG_actualizar_estado_lead
+                                                          ├─→ PG_actualizar_conversacion (existente)
+                                                          └─→ PG_get_pipeline_y_operativas_lead (nuevo)
+                                                                  → GET_labels_contacto_actual
+                                                                  → POST_sincronizar_labels_contacto_cada_turno
+```
+
+**Nodos nuevos:**
+
+`PG_get_pipeline_y_operativas_lead` — trae en una sola consulta la etiqueta de pipeline vigente y las etiquetas operativas activas:
+```sql
+SELECT
+  l.estado_lead AS etiqueta_pipeline,
+  (SELECT array_agg(nombre) FROM etiquetas_pipeline WHERE empresa_id = l.empresa_id) AS pipeline_validas,
+  (SELECT array_agg(eo.etiqueta) FROM etiquetas_operativas eo
+   WHERE eo.empresa_id = l.empresa_id AND eo.activo = true
+   AND eo.etiqueta = ANY(c.etiquetas)) AS operativas_presentes
+FROM leads l
+JOIN conversaciones c ON c.lead_id = l.id
+WHERE l.empresa_id = (SELECT id FROM empresas WHERE chatwoot_account_id = {{ $('Contexto').item.json.account_id }} LIMIT 1)
+AND c.chatwoot_conversation_id = {{ $('Contexto').item.json.conversation_id }};
+```
+
+`GET_labels_contacto_actual` — trae las labels actuales del contacto en Chatwoot (mismo patrón HTTP que el existente).
+
+`POST_sincronizar_labels_contacto_cada_turno` — combina todo, reemplazando cualquier etiqueta de pipeline vieja por la vigente, sin tocar otras labels del contacto:
+```javascript
+={{ {
+  "labels": Array.from(new Set([
+    ...($('GET_labels_contacto_actual').item.json.payload || [])
+      .filter(e => !($('PG_get_pipeline_y_operativas_lead').item.json.pipeline_validas || []).includes(e)),
+    $('PG_get_pipeline_y_operativas_lead').item.json.etiqueta_pipeline,
+    ...($('PG_get_pipeline_y_operativas_lead').item.json.operativas_presentes || [])
+  ].filter(Boolean)))
+} }}
+```
+
+⚠️ **Bug encontrado y corregido durante la implementación — condición de carrera (race condition):** el primer intento conectó la rama nueva directamente desde `actualizar_estado_lead` (un nodo HTTP que solo escribe el custom attribute en **Chatwoot**, no en Postgres). El verdadero `UPDATE` de `leads.estado_lead` ocurre en un nodo distinto y posterior, `PG_actualizar_estado_lead`, dentro de la cadena de `actualizar_etiqueta`. Como la rama nueva corría en paralelo (al mismo tiempo que esa cadena, no después), la lectura de Postgres ganaba la carrera contra la escritura, trayendo siempre el valor del turno anterior — síntoma: la etiqueta del contacto se actualizaba con un mensaje de retraso. **Fix:** mover el origen de la conexión a `PG_actualizar_estado_lead` (el nodo que realmente termina de escribir el dato), no a `actualizar_estado_lead` (que solo lo parece por el nombre).
+
+**Validado:** prueba en tiempo real — cambio de etapa del clasificador reflejado en el contacto de Chatwoot en el mismo turno, sin desfase.
+
+**Pendiente:** `POST_sincronizar_etiquetas_contacto` (Rama de `desactivar_bot`) queda intacto por ahora, en desuso de facto para el propósito de campañas — evaluar si retirarlo en una sesión futura, una vez confirmado que el nuevo punto cubre completamente su función.
 
 ### 5.2 Administración desde Appsmith
 
@@ -211,7 +259,7 @@ Discutido pero **no implementado todavía** (queda para un paso separado, según
 - [x] Quitar la fila de prueba `lead-tibio` de `etiquetas_operativas` (sigue desactivada por la prueba de regresión) o reactivarla/decidir su uso definitivo. → **Decisión:** desactivada permanentemente (`activo = false`) vía Appsmith. Era solo de prueba, no responde a una necesidad real de negocio de agencIA.
 - [x] Documentar en Appsmith cómo administrar esta tabla (agregar panel similar al de `recordatorio_config`) — ver sección 5.2.
 - [ ] **Desfase de un turno en `If_clasificar_lead`** (ver sección 7.1) — decidir si se corrige moviendo la verificación de posición en el flujo, o se deja documentado como limitación aceptada.
-- [ ] Revisar el hallazgo relacionado en `POST_sincronizar_etiquetas_contacto` (sección 5.1) — mismo patrón de etiquetas hardcodeadas, en un nodo distinto.
+- [x] Revisar el hallazgo relacionado en `POST_sincronizar_etiquetas_contacto` (sección 5.1) — **resuelto**: construido punto de sincronización nuevo e independiente que corre cada turno, sin depender de `desactivar_bot`. Bug de condición de carrera encontrado y corregido en el camino.
 - [ ] Ejecutar la migración de `es_conversion` hacia `etiquetas_operativas` (sección 6), una vez auditados todos los caminos de conversión.
 
 ### 7.1 Hallazgo: desfase de un turno en la verificación
