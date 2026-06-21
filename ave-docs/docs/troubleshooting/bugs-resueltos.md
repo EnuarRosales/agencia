@@ -225,3 +225,31 @@ WHERE id = {{tbl_etiquetas_oper.updatedRow.id}};
 **Solución:** Mover el origen de la conexión nueva desde `actualizar_estado_lead` hacia `PG_actualizar_estado_lead` — el nodo que efectivamente termina de escribir el dato en Postgres.
 
 **Lección crítica:** Cuando se conecta una rama nueva a un nodo existente basándose en su nombre, **verificar el tipo de nodo y su contenido real antes de asumir qué hace** — especialmente cuando existen dos nodos con nombres casi idénticos (`actualizar_estado_lead` vs `PG_actualizar_estado_lead`) que sugieren la misma función pero operan sobre sistemas distintos (Chatwoot vs Postgres). Esto refuerza la lección del Bug 11: los nombres de nodos importan, y nombres ambiguos o casi-duplicados son una fuente directa de bugs de timing difíciles de diagnosticar sin inspección directa.
+
+---
+
+## Bug 14: Casi se rompe `actualizar_etiqueta` por desconectar un nodo "solo de lectura" sin revisar referencias internas
+
+**Síntoma:** Ninguno todavía — este bug se **evitó** antes de llegar a producción, gracias a una verificación previa. Se documenta como caso de estudio porque el error estuvo a punto de cometerse y la lección es igual de valiosa que un bug real.
+
+**Lo que se intentó:** Al mover el mecanismo de verificación de `desactivar_bot` a un punto distinto del flujo (para eliminar el [desfase de un turno](../modulos/desactivar-bot.md)), el plan era desconectar `get_estado_conversacion → GET_etiquetas_actuales` de su posición original, asumiendo que esa cadena solo alimentaba la verificación que se estaba moviendo.
+
+**Por qué casi fue un error grave:** Una búsqueda de **todas** las referencias `$('GET_etiquetas_actuales')` en el workflow (no solo sus conexiones de salida visibles) reveló que era usado por **otros nodos centrales del flujo principal** (`actualizar_etiqueta`, `PG_actualizar_conversacion`), ya validados y en producción. En n8n, un nodo ejecutado en cualquier punto de un flujo queda disponible para **cualquier nodo posterior en la misma ejecución**, sin importar la "rama" — así que `GET_etiquetas_actuales`, aunque corre al inicio del turno, su resultado se sigue usando más adelante. Desconectarlo habría roto ese flujo central.
+
+**Cómo se evitó:** Antes de desconectar nada, se hizo una búsqueda de texto completa por el nombre del nodo en **todo** el JSON del workflow (no solo el grafo de conexiones), revelando todos sus usos reales.
+
+**Lección crítica:** Las conexiones visibles en el canvas (el grafo de `connections`) **no son la única forma en que un nodo depende de otro** en n8n. Las expresiones `$('NombreDeNodo')` crean dependencias implícitas que no aparecen como líneas en el diagrama. Antes de mover o eliminar cualquier nodo, buscar **todas las referencias por nombre** en el JSON completo del workflow — no basta con revisar las conexiones de entrada/salida visibles.
+
+---
+
+## Bug 15: La tool del agente sincronizaba a Chatwoot pero un nodo posterior sobrescribía el valor con datos viejos de Postgres
+
+**Síntoma:** El agente usaba la tool `desactivar_bot` correctamente (`true` se aplicaba en Chatwoot), pero segundos después, en el mismo turno, el valor volvía a `false` solo — visible en el log de Chatwoot como *"Automation System agregó desactivar_bot"* seguido de *"Automation System eliminó a desactivar_bot"*.
+
+**Causa raíz:** La tool `desactivar_bot` del agente escribe **directo a Chatwoot** (custom attribute), pero **nunca actualiza Postgres** — no existía ningún mecanismo que sincronizara ese cambio hacia la base de datos. Más adelante en el mismo turno, el nodo `actualizar_estado_lead` reconstruye el custom attribute completo (necesario desde el [Bug 3](#bug-3-custom-attributes-se-borran-en-cada-turno), que exige mandar el objeto completo) usando como fuente el valor de `desactivar_bot` guardado en **Postgres** — que seguía en `false`, porque nunca se había sincronizado. Al reconstruir el objeto completo con ese dato viejo, sobrescribía el `true` que la tool acababa de poner instantes antes.
+
+**Cómo se destapó:** Inspección directa de la ejecución real en n8n, turno por turno: se confirmó que `PG_get_conversacion_actual` (la fuente de datos de `actualizar_estado_lead`) devolvía `desactivar_bot: false`, mientras que el output de la tool, momentos antes, había sido `true`.
+
+**Solución:** Insertar una lectura **fresca** del estado real en Chatwoot (`GET /conversations/{id}`, que captura cualquier cambio hecho por la tool en el mismo turno) justo antes de que `actualizar_estado_lead` reconstruya el custom attribute — usando ese valor fresco en vez del valor potencialmente desactualizado de Postgres. Se agregó además un nodo que sincroniza ese mismo valor fresco hacia Postgres, cerrando finalmente la sincronización tool↔base de datos que nunca había existido.
+
+**Lección crítica:** Cuando un valor se escribe en un sistema externo (Chatwoot) sin sincronizarlo a la base de datos propia, cualquier nodo posterior que "reconstruya el estado completo" usando la base de datos como fuente de verdad **revertirá silenciosamente** ese cambio externo, sin ningún error visible — porque desde la perspectiva de ese nodo, simplemente está haciendo su trabajo con los datos que tiene. La fuente de verdad real, en estos casos, debe ser el sistema que **acaba de cambiar** (Chatwoot, recién escrito por la tool), no la base de datos que aún no se enteró del cambio.

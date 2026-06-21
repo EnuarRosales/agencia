@@ -1,12 +1,12 @@
 # Módulo: Sincronización `desactivar_bot` y etiquetas de contacto
 
-**Estado:** Diseño implementado y validado completamente. Bug original (duplicación en dos caminos paralelos) resuelto. Sincronización de pipeline al contacto construida, depurada (condición de carrera) y validada en producción. Rama vieja redundante retirada limpiamente. Quedan pendientes secundarios (ver sección 7).
+**Estado:** Completo y validado en producción. Incluye: bug original resuelto, sincronización de pipeline al contacto, mecanismo de desactivación inmediata (sin desfase de turno), y fix del bug raíz de sincronización tool↔Postgres que motivó toda la sesión. Quedan pendientes secundarios menores (ver sección 7).
 
 ---
 
-## 1. Concepto clave: dos tipos de etiquetas en AVE
+## 1. Concepto clave: tres tipos de etiquetas en AVE
 
-Antes de explicar el módulo, es necesario distinguir dos categorías de etiquetas que existen en el sistema y que **no deben mezclarse** — confundirlas fue la causa raíz del bug documentado en la sección 4.
+Antes de explicar el módulo, es necesario distinguir las categorías de etiquetas que existen en el sistema y que **no deben mezclarse** — confundir las dos primeras fue la causa raíz del bug documentado en la sección 4.
 
 ### 1.1 Etiquetas funcionales / de calificación
 
@@ -37,7 +37,28 @@ Características:
 - Cada una dispara una acción de sistema específica.
 - Viven en tablas dedicadas, separadas de `etiquetas_pipeline` (ver tabla `etiquetas_operativas` en sección 5).
 
-**Regla de diseño:** nunca mezclar ambos tipos en la misma tabla ni en la misma lógica de control. Cada tipo tiene su propia tabla de configuración y su propio propósito.
+### 1.3 Etiquetas fijas del sistema
+
+Un tercer tipo, descubierto al construir la sincronización de etiquetas al contacto (sección 5.1): etiquetas que **no son configurables por el usuario ni dependen de ninguna tabla de configuración** — son hechos objetivos que el sistema aplica siempre, de forma fija, cuando ocurre un evento concreto.
+
+Ejemplo: `agendado`. Se aplica automáticamente cuando `registrar_cita_pg` confirma que una cita quedó guardada en la base de datos. No es una regla de negocio que varíe por empresa ni que se pueda activar/desactivar desde Appsmith — es un hecho: o el lead agendó, o no agendó.
+
+**Diferencias clave frente a las etiquetas operativas (configurables):**
+
+| | Operativas (configurables) | Sistema (fijas) |
+|---|---|---|
+| ¿Dónde se define? | Tabla `etiquetas_operativas`, editable desde Appsmith | Hardcodeada en el query (es un hecho, no una regla) |
+| ¿Varía por empresa? | Sí — cada empresa decide qué etiquetas y qué acciones | No — el hecho es el mismo para todas |
+| ¿Se puede activar/desactivar? | Sí, vía columna `activo` | No aplica — el hecho ocurrió o no ocurrió |
+| Comportamiento al sincronizar al contacto | Se **reemplaza**: si deja de estar presente en la conversación, se quita del contacto | Se **acumula permanentemente**: una vez ocurrido el hecho, queda para siempre en el contacto |
+
+**Por qué el comportamiento de sincronización es distinto:** una etiqueta operativa configurable representa un **estado actual** ("¿debe estar desactivado el bot ahora mismo?") — si cambia, el contacto debe reflejar el estado nuevo, no el viejo. Una etiqueta de sistema representa un **hecho histórico** ("¿alguna vez agendó este lead?") — sigue siendo cierto para siempre, independientemente del estado actual de la conversación. Por eso `agendado` nunca se filtra ni se quita del contacto, a diferencia de `desactivar_bot` (que sí se quita si la conversación se reactiva).
+
+**Regla de diseño:** antes de agregar una nueva etiqueta a cualquier mecanismo de sincronización, preguntarse: ¿es una regla de negocio que el cliente podría querer cambiar o desactivar? → va en `etiquetas_operativas`. ¿Es un hecho fijo del sistema, igual para todas las empresas? → va como etiqueta de sistema, hardcodeada en el query, y se trata como permanente al sincronizar.
+
+**Implementación actual:** `agendado` es, por ahora, la única etiqueta de este tipo. Se detecta en `PG_get_pipeline_y_operativas_lead` con un `CASE WHEN 'agendado' = ANY(c.etiquetas)...` dedicado, devuelto como `sistema_presentes`, y se agrega (nunca se filtra) en `POST_sincronizar_labels_contacto_cada_turno`. Si en el futuro aparecen más etiquetas de este tipo, vale la pena generalizar este patrón (hoy es una sola, escrita a mano; con 2-3 más convendría un array fijo en vez de un `CASE` por cada una).
+
+`compra-realizada` **no se usa** actualmente en agencIA (existía en el flujo viejo hardcodeado, pero no hay confirmación de que `registrar_pedido` aplique ninguna etiqueta al completarse una compra) — no se agregó como etiqueta de sistema por ahora.
 
 ---
 
@@ -278,6 +299,7 @@ La cadena `get_estado_conversacion → GET_etiquetas_actuales → PG_check_desac
 
 | Fecha | Versión | Cambio | Autor |
 |---|---|---|---|
+| 2026-06-21 | 2.0 | **Eliminado el desfase de un turno + resuelto el bug original de sincronización de la tool del agente.** Construido mecanismo de desactivación inmediata (`PG_check_desactivar_bot_v2` → `If_debe_desactivar_bot_v2` → aplica en el mismo turno, sin esperar al siguiente mensaje), conectado de forma segura en paralelo a `PG_actualizar_estado_lead` sin tocar `GET_etiquetas_actuales` (nodo compartido — casi se rompe por error, ver lección abajo). Retirado el mecanismo viejo (`PG_check_desactivar_bot`, `If_debe_desactivar_bot` v1, y su cadena), reconectando el flujo principal hacia `obtener_historial`.<br><br>**Hallazgo y fix del bug original real:** la tool `desactivar_bot` del agente escribe directo a Chatwoot pero nunca a Postgres; `actualizar_estado_lead` (que corre después en el mismo turno) leía el valor viejo de Postgres y **sobrescribía** el cambio recién hecho por la tool. Corregido insertando `GET_custom_attributes_fresco` (lee el estado real de Chatwoot post-tool) antes de `actualizar_estado_lead`, y `PG_sync_estado_real_chatwoot` para reflejar ese valor fresco en Postgres — cerrando por fin la sincronización tool↔Postgres que era el objetivo original de toda esta sesión.<br><br>**Nueva categoría de etiquetas identificada:** etiquetas fijas del sistema (sección 1.3) — `agendado` se sincroniza al contacto de forma permanente, sin pasar por `etiquetas_operativas`, a diferencia de las operativas configurables que se reemplazan. Corregido también que las etiquetas operativas se quitaran del contacto al dejar de aplicar (antes solo se acumulaban). | Enuar |
 | 2026-06-20 | 1.1 | **Sincronización de pipeline al contacto completada.** Construido punto único de sincronización (`PG_get_pipeline_y_operativas_lead` → `GET_labels_contacto_actual` → `POST_sincronizar_labels_contacto_cada_turno`) que corre en cada turno, habilitando segmentación de campañas por etapa de pipeline real. Bug de condición de carrera encontrado y corregido (conexión movida de `actualizar_estado_lead` a `PG_actualizar_estado_lead`, documentado como [Bug 13](../troubleshooting/bugs-resueltos.md#bug-13-condición-de-carrera-por-conectar-una-rama-nueva-al-nodo-con-nombre-engañoso)). Retirada limpiamente la rama vieja redundante (`GET_etiquetas_contacto`, `POST_sincronizar_etiquetas_contacto`). Renombrado `If_clasificar_lead` → `If_debe_desactivar_bot` para reflejar su función real. Validado completo en producción tras el retiro. | Enuar |
 | 2026-06-20 | 1.0 | **Bug resuelto y validado.** Hallazgo clave: existía un segundo camino duplicado (`If_forzar_desactivar_bot`) con el mismo patrón hardcodeado, no detectado en el diagnóstico inicial — explicaba por qué el bug reaparecía pese a haber corregido `If_clasificar_lead`. Eliminados `If_forzar_desactivar_bot`, `desactivar_bot_auto` y `PG_sync_desactivar_bot_auto`; unificado en un solo camino de control vía `PG_check_desactivar_bot`. Prueba de regresión limpia exitosa: conversación agendada con etiqueta `exitoso`, `desactivar_bot` permaneció en `false` correctamente. | Enuar |
 | 2026-06-20 | 0.2 | Implementado y validado parcialmente: tabla `etiquetas_operativas` (con columna `accion`, pensada para alojar tambien la futura migracion de seguimiento), nodo `PG_check_desactivar_bot`, sincronizacion a Chatwoot agregada. Validado el mecanismo configurable con `lead-tibio`. Detectado y documentado el desfase de un turno. | Enuar |
