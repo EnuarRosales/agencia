@@ -253,3 +253,64 @@ WHERE id = {{tbl_etiquetas_oper.updatedRow.id}};
 **Solución:** Insertar una lectura **fresca** del estado real en Chatwoot (`GET /conversations/{id}`, que captura cualquier cambio hecho por la tool en el mismo turno) justo antes de que `actualizar_estado_lead` reconstruya el custom attribute — usando ese valor fresco en vez del valor potencialmente desactualizado de Postgres. Se agregó además un nodo que sincroniza ese mismo valor fresco hacia Postgres, cerrando finalmente la sincronización tool↔base de datos que nunca había existido.
 
 **Lección crítica:** Cuando un valor se escribe en un sistema externo (Chatwoot) sin sincronizarlo a la base de datos propia, cualquier nodo posterior que "reconstruya el estado completo" usando la base de datos como fuente de verdad **revertirá silenciosamente** ese cambio externo, sin ningún error visible — porque desde la perspectiva de ese nodo, simplemente está haciendo su trabajo con los datos que tiene. La fuente de verdad real, en estos casos, debe ser el sistema que **acaba de cambiar** (Chatwoot, recién escrito por la tool), no la base de datos que aún no se enteró del cambio.
+
+---
+
+## Bug 16 — Inconsistencia de timezone y tipo de columna en recordatorios (rama ELSE)
+
+**Workflow:** `AVE - Recordatorios Automaticos`
+**Nodos afectados:** `PG_get_conversaciones_pendientes`, `PG_marcar`
+**Tabla afectada:** `conversaciones` (columna `ultimo_recordatorio_at`)
+
+### Síntomas
+-Uhanne (empresa_id=7) no generaba recordatorios pese a tener `recordatorio_config` activa y conversaciones elegibles.
+-El cálculo de tiempo para el segundo recordatorio en adelante quedaba desfasado 5 horas respecto al primero.
+
+### Causa raíz (doble)
+1. **Tipo de columna inconsistente:** `ultimo_recordatorio_at` era `timestamp WITH time zone`, mientras `ultimo_mensaje_usuario_at`, `created_at` y `updated_at` eran `timestamp WITHOUT time zone`. Esto generaba dos sistemas de tiempo dentro del mismo nodo.
+2. **`NOW()` sin huso en la rama ELSE:** la rama del primer recordatorio (orden 1) usaba `(NOW() AT TIME ZONE 'America/Bogota')`, pero la rama ELSE (orden 2+) usaba `NOW()` puro. Mismo patrón que el Bug 9.
+
+### Fix aplicado
+**1. Migración de la columna a hora Bogotá sin zona:**
+```sql
+ALTER TABLE conversaciones
+  ALTER COLUMN ultimo_recordatorio_at TYPE timestamp without time zone
+  USING ultimo_recordatorio_at AT TIME ZONE 'America/Bogota';
+```
+Resultado: las cuatro columnas temporales de `conversaciones` quedan `timestamp without time zone` en hora Bogotá.
+
+**2. `PG_get_conversaciones_pendientes` — rama ELSE:**
+```sql
+-- Antes:
+c.ultimo_recordatorio_at < NOW() - INTERVAL '1 hour' * (...)
+-- Después:
+c.ultimo_recordatorio_at < (NOW() AT TIME ZONE 'America/Bogota') - INTERVAL '1 hour' * (...)
+```
+
+**3. `PG_marcar`:**
+```sql
+-- Antes:
+ultimo_recordatorio_at = NOW(),
+updated_at = NOW()
+-- Después:
+ultimo_recordatorio_at = NOW() AT TIME ZONE 'America/Bogota',
+updated_at = NOW() AT TIME ZONE 'America/Bogota'
+```
+
+### Regla derivada
+La regla no es "siempre `AT TIME ZONE`", sino **coherencia entre lo que se escribe y lo que se compara**. Antes de aplicar `AT TIME ZONE` a una columna, verificar su `data_type`:
+- `timestamp without time zone` → `AT TIME ZONE 'America/Bogota'` correcto (modelo AVE).
+- `timestamp with time zone` → aplicar `AT TIME ZONE` lo convierte a sin-zona desplazado −5h; introduce el bug por el otro lado.
+
+Verificación de tipos antes de tocar SQL temporal:
+```sql
+SELECT column_name, data_type
+FROM information_schema.columns
+WHERE table_name = 'conversaciones'
+  AND column_name LIKE '%_at';
+```
+
+### Estado
+✅ Resuelto y verificado. Las cuatro columnas confirmadas como `timestamp without time zone`.
+
+
