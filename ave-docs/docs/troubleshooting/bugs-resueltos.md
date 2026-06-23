@@ -256,61 +256,138 @@ WHERE id = {{tbl_etiquetas_oper.updatedRow.id}};
 
 ---
 
-## Bug 16 — Inconsistencia de timezone y tipo de columna en recordatorios (rama ELSE)
+# Bugs resueltos — Workflow AVE_Recordatorios_Automaticos (sesión 22 jun 2026)
+
+> Bloque a anexar a `docs/troubleshooting/bugs-resueltos.md`. Cubre los bugs 16 a 19,
+> todos en el workflow `AVE - Recordatorios Automaticos`.
+
+---
+
+## Bug 16 — Inconsistencia de timezone y tipo de columna
 
 **Workflow:** `AVE - Recordatorios Automaticos`
-**Nodos afectados:** `PG_get_conversaciones_pendientes`, `PG_marcar`
-**Tabla afectada:** `conversaciones` (columna `ultimo_recordatorio_at`)
+**Nodos:** `PG_get_conversaciones_pendientes`, `PG_marcar`
+**Tabla:** `conversaciones` (columna `ultimo_recordatorio_at`)
 
-### Síntomas
--Uhanne (empresa_id=7) no generaba recordatorios pese a tener `recordatorio_config` activa y conversaciones elegibles.
--El cálculo de tiempo para el segundo recordatorio en adelante quedaba desfasado 5 horas respecto al primero.
+### Síntoma
+El cálculo de tiempo del segundo recordatorio en adelante quedaba desfasado respecto al primero.
 
 ### Causa raíz (doble)
-1. **Tipo de columna inconsistente:** `ultimo_recordatorio_at` era `timestamp WITH time zone`, mientras `ultimo_mensaje_usuario_at`, `created_at` y `updated_at` eran `timestamp WITHOUT time zone`. Esto generaba dos sistemas de tiempo dentro del mismo nodo.
-2. **`NOW()` sin huso en la rama ELSE:** la rama del primer recordatorio (orden 1) usaba `(NOW() AT TIME ZONE 'America/Bogota')`, pero la rama ELSE (orden 2+) usaba `NOW()` puro. Mismo patrón que el Bug 9.
+1. **Tipo de columna inconsistente:** `ultimo_recordatorio_at` era `timestamp WITH time zone`,
+   mientras `ultimo_mensaje_usuario_at`, `created_at` y `updated_at` eran `timestamp WITHOUT time zone`.
+   Dos sistemas de tiempo conviviendo en el mismo nodo.
+2. **`NOW()` sin huso en la rama ELSE:** la rama del primer recordatorio usaba
+   `(NOW() AT TIME ZONE 'America/Bogota')`, pero la rama ELSE (orden 2+) usaba `NOW()` puro.
+   Mismo patrón que el Bug 9.
 
-### Fix aplicado
-**1. Migración de la columna a hora Bogotá sin zona:**
+### Fix
+Migración de la columna rebelde a hora Bogotá sin zona:
 ```sql
 ALTER TABLE conversaciones
   ALTER COLUMN ultimo_recordatorio_at TYPE timestamp without time zone
   USING ultimo_recordatorio_at AT TIME ZONE 'America/Bogota';
 ```
-Resultado: las cuatro columnas temporales de `conversaciones` quedan `timestamp without time zone` en hora Bogotá.
-
-**2. `PG_get_conversaciones_pendientes` — rama ELSE:**
-```sql
--- Antes:
-c.ultimo_recordatorio_at < NOW() - INTERVAL '1 hour' * (...)
--- Después:
-c.ultimo_recordatorio_at < (NOW() AT TIME ZONE 'America/Bogota') - INTERVAL '1 hour' * (...)
-```
-
-**3. `PG_marcar`:**
-```sql
--- Antes:
-ultimo_recordatorio_at = NOW(),
-updated_at = NOW()
--- Después:
-ultimo_recordatorio_at = NOW() AT TIME ZONE 'America/Bogota',
-updated_at = NOW() AT TIME ZONE 'America/Bogota'
-```
+`PG_get_conversaciones_pendientes` rama ELSE y `PG_marcar` → ambos usan
+`NOW() AT TIME ZONE 'America/Bogota'`. Las cuatro columnas temporales quedan
+`timestamp without time zone` en hora Bogotá.
 
 ### Regla derivada
-La regla no es "siempre `AT TIME ZONE`", sino **coherencia entre lo que se escribe y lo que se compara**. Antes de aplicar `AT TIME ZONE` a una columna, verificar su `data_type`:
+La regla no es "siempre `AT TIME ZONE`", sino **coherencia entre lo que se escribe y lo que se compara**.
+Verificar siempre el `data_type` antes de aplicar `AT TIME ZONE`:
 - `timestamp without time zone` → `AT TIME ZONE 'America/Bogota'` correcto (modelo AVE).
-- `timestamp with time zone` → aplicar `AT TIME ZONE` lo convierte a sin-zona desplazado −5h; introduce el bug por el otro lado.
+- `timestamp with time zone` → aplicar `AT TIME ZONE` lo convierte a sin-zona desplazado −5h; reintroduce el bug.
 
-Verificación de tipos antes de tocar SQL temporal:
 ```sql
-SELECT column_name, data_type
-FROM information_schema.columns
-WHERE table_name = 'conversaciones'
-  AND column_name LIKE '%_at';
+SELECT column_name, data_type FROM information_schema.columns
+WHERE table_name = 'conversaciones' AND column_name LIKE '%_at';
 ```
 
-### Estado
-✅ Resuelto y verificado. Las cuatro columnas confirmadas como `timestamp without time zone`.
+---
 
+## Bug 17 — Loop de empresas moría en la primera sin pendientes
+
+**Nodos:** `If_hay_pendientes`, `Loop_empresas`
+
+### Síntoma
+Solo se procesaba la primera empresa (agencIA). Uhane y PC_Outlet nunca recibían recordatorios.
+
+### Causa raíz
+La rama FALSE de `If_hay_pendientes` no estaba conectada a nada. Cuando una empresa no tenía
+pendientes, el flujo se detenía ahí y nunca regresaba a `Loop_empresas` para procesar las siguientes.
+
+### Fix
+Conectar la rama FALSE de `If_hay_pendientes` de regreso a `Loop_empresas`:
+- TRUE  → `Loop_conversaciones` (procesa)
+- FALSE → `Loop_empresas` (siguiente empresa)
+
+---
+
+## Bug 18 — Nodo Postgres detenía el flujo al devolver vacío
+
+**Nodo:** `PG_get_conversaciones_pendientes`
+
+### Síntoma
+El workflow se detenía silenciosamente cuando una empresa no tenía conversaciones pendientes.
+n8n muestra: "n8n stops executing the workflow when a node has no output data."
+
+### Causa raíz
+Por defecto, un nodo sin filas de salida termina la ejecución de esa rama. Como agencIA
+(primera empresa) no tenía pendientes, cortaba todo antes de llegar a `If_hay_pendientes`,
+dejando inútil el fix del Bug 17.
+
+### Fix
+Activar **"Always Output Data"** (`alwaysOutputData: true`) en `PG_get_conversaciones_pendientes`.
+Así emite un item (vacío) aunque no haya filas, y `If_hay_pendientes` puede evaluarlo y enrutar.
+
+> Nota: los tres fixes (17, 18 y "Continue On Fail" del 19) son interdependientes. En workflows
+> con loops anidados en n8n se necesitan los tres juntos, o cualquier caso borde detiene el lote.
+
+---
+
+## Bug 19 — Conversación borrada en Chatwoot tumbaba el lote (+ Capa 2: auto-desactivación)
+
+**Nodos:** `GET_historial`, `OpenAI_generar`, `Chatwoot_enviar` (Capa 1);
+`If_conversacion_existe`, `PG_marcar_fantasma` (Capa 2, nuevos)
+
+### Síntoma
+Al intentar enviar a una conversación borrada/cerrada en Chatwoot, la API devolvía 404 y la
+ejecución se detenía, dejando sin procesar las conversaciones siguientes del lote.
+
+### Causa raíz
+Las conversaciones borradas en Chatwoot seguían marcadas como `estado = 'abierta'` y
+`en_seguimiento_activo = true` en Postgres. El workflow las reintentaba en cada ciclo, y el 404
+sin manejo rompía el lote.
+
+### Fix — Capa 1 (red de seguridad)
+"Continue On Fail" (`onError: continueRegularOutput`) en los tres nodos HTTP: `GET_historial`,
+`OpenAI_generar`, `Chatwoot_enviar`. Un 404 puntual salta esa conversación sin tumbar el lote.
+
+### Fix — Capa 2 (auto-sincronización)
+Detectar la conversación inexistente y desactivarla en Postgres para no reintentarla nunca más:
+- `GET_historial` → `If_conversacion_existe` (condición: `{{ $json.payload }}` **exists**)
+  - TRUE (existe payload) → `Code_historial` → flujo normal
+  - FALSE (404, sin payload, item con `error`) → `PG_marcar_fantasma` → `Loop_conversaciones`
+- `PG_marcar_fantasma`:
+```sql
+UPDATE conversaciones SET
+  en_seguimiento_activo = false,
+  updated_at = NOW() AT TIME ZONE 'America/Bogota'
+WHERE id = {{ $('Loop_conversaciones').item.json.conversacion_id }};
+```
+
+### Detalle técnico clave (n8n 2.23.3)
+Cuando un nodo HTTP con `continueRegularOutput` falla, n8n **reemplaza el item por un objeto
+`error`** (no deja el payload vacío). Por eso la condición "¿existe `payload`?" detecta
+correctamente el fallo: el item fantasma no tiene `payload`, tiene `error`, y cae por FALSE.
+
+### Por qué `en_seguimiento_activo = false` y no `estado = 'cerrada'`
+Acción quirúrgica: solo apaga los recordatorios sin afectar otros procesos que leen `estado`
+(flujo principal, dashboard, reportes). Que una conversación se borre en Chatwoot significa
+"ya no puedo enviarle recordatorios", no necesariamente "negocio cerrado". Coherente con la
+desactivación manual ya usada en AVE.
+
+### Validación
+Probado con conversación real borrada en Chatwoot (chatwoot_conversation_id=100): `GET_historial`
+dio 404 → `If_conversacion_existe` la mandó por FALSE → `PG_marcar_fantasma` ejecutó con
+`success: true` → confirmado en BD `en_seguimiento_activo = false`.
 
