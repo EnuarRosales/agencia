@@ -391,3 +391,137 @@ Probado con conversación real borrada en Chatwoot (chatwoot_conversation_id=100
 dio 404 → `If_conversacion_existe` la mandó por FALSE → `PG_marcar_fantasma` ejecutó con
 `success: true` → confirmado en BD `en_seguimiento_activo = false`.
 
+# Bugs y cambios — Flujo principal agencIA (sesión 22 jun 2026, parte 2)
+
+> Bloque a anexar a `docs/troubleshooting/bugs-resueltos.md`. Cubre los bugs 20 y 21
+> y la migración de `es_conversion`, todos en el workflow `Flujo principal agencIA`.
+
+---
+
+## Migración: es_conversion → etiquetas_operativas (acción desactivar_seguimiento)
+
+### Contexto / problema
+El nodo `PG_check_es_conversion` leía la columna `es_conversion` de `etiquetas_pipeline`
+para decidir si apagar el seguimiento automático (recordatorios). Esto mezclaba dos conceptos
+distintos en una sola fuente:
+
+- **`es_conversion`** (columna en `etiquetas_pipeline`): marca si se cumplió el objetivo del
+  agente. Sirve para **reportes**. Existe solo en BD, NO en Chatwoot.
+- **`desactivar_seguimiento`** (acción en `etiquetas_operativas`): comportamiento **operativo** —
+  dejar de enviar recordatorios.
+
+Son **ejes independientes**: una etiqueta puede contar como conversión para reportes y aun así
+seguir recibiendo recordatorios (ej. PC Outlet con `cliente-potencial`), o viceversa.
+
+### Solución
+Se mantienen separados:
+- `etiquetas_pipeline.es_conversion` → se queda. Solo para reportes. NO se toca.
+- `etiquetas_operativas` con `accion = 'desactivar_seguimiento'` → controla el corte de
+  recordatorios, configurable por etiqueta/empresa desde Appsmith.
+
+El nodo `PG_check_es_conversion` se migró para leer de `etiquetas_operativas`, conservando el
+alias de salida `es_conversion` (para no tocar `If_es_conversion`):
+
+```sql
+SELECT COALESCE(
+  (SELECT true FROM etiquetas_operativas eo
+   WHERE eo.empresa_id = (SELECT id FROM empresas WHERE chatwoot_account_id = {{ $('Contexto').item.json.account_id }} LIMIT 1)
+     AND eo.accion = 'desactivar_seguimiento'
+     AND eo.activo = true
+     AND eo.etiqueta = '{{ $('AI_Agent_Clasificador').item.json.output }}'
+   LIMIT 1),
+  false
+) AS es_conversion;
+```
+
+### Datos insertados (jun 2026)
+```sql
+INSERT INTO etiquetas_operativas (empresa_id, etiqueta, accion, activo)
+VALUES
+  (1, 'exitoso',          'desactivar_seguimiento', true),
+  (7, 'compra-realizada', 'desactivar_seguimiento', true);
+-- PC Outlet (8) NO se incluye: cliente-potencial cuenta como conversión para reportes
+-- pero debe seguir recibiendo recordatorios.
+```
+
+---
+
+## Bug 20 — en_seguimiento se apagaba pero nunca se reactivaba
+
+**Workflow:** `Flujo principal agencIA`
+**Nodos:** `If_es_conversion` y rama FALSE (nuevos: `Chatwoot_reactivar_en_seguimiento`, `PG_reactivar_seguimiento`)
+
+### Síntoma
+Tras marcar un lead como `exitoso` (que apaga `en_seguimiento`), si el lead se enfriaba a
+`lead-frio`, el seguimiento **permanecía desactivado** — no se reactivaba pese a que la etiqueta
+ya no era de conversión.
+
+### Causa raíz
+`If_es_conversion` tenía solo la rama TRUE conectada (apaga seguimiento en Chatwoot + Postgres).
+La rama FALSE estaba vacía: el sistema solo sabía **apagar**, nunca **encender**. Lógica de una
+sola dirección.
+
+### Fix
+Conectar la rama FALSE a dos nodos nuevos que reactivan en ambos lados:
+- `Chatwoot_reactivar_en_seguimiento` → POST custom_attributes con `en_seguimiento: true`
+- `PG_reactivar_seguimiento` → `UPDATE conversaciones SET en_seguimiento_activo = true ...`
+
+Ahora `en_seguimiento` refleja el estado actual de la etiqueta en cada turno:
+- Etiqueta con `accion = desactivar_seguimiento` → OFF.
+- Cualquier otra etiqueta → ON.
+
+### Nota operativa importante (override manual)
+Como consecuencia del fix, `en_seguimiento` se **re-evalúa y reactiva en cada turno** según la
+etiqueta actual. Esto significa que **apagar `en_seguimiento` manualmente NO persiste**: el
+siguiente turno lo reactivará si la etiqueta no es de conversión.
+
+**Forma correcta de congelar una conversación (intervención manual):** activar `desactivar_bot`.
+Al desactivar el bot, el flujo principal deja de procesar esa conversación turno a turno, por lo
+que tampoco vuelve a tocar `en_seguimiento`, y el estado se mantiene.
+
+**Regla:** NO manipular `en_seguimiento` de forma aislada — es una variable que maneja la lógica
+del programa (se reactiva según etiqueta cada turno). Para intervención manual, usar
+`desactivar_bot` + opcionalmente quitar `en_seguimiento`.
+
+---
+
+## Bug 21 — La prioridad subía pero nunca bajaba
+
+**Workflow:** `Flujo principal agencIA`
+**Nodos:** `actualizar_prioridad`, nodo `If` (eliminado)
+
+### Síntoma
+Cuando un lead pasaba de una etiqueta de prioridad alta (ej. `exitoso` = urgent) a una de
+prioridad baja (`lead-frio` = none), la prioridad en Chatwoot **se mantenía en el valor alto** —
+no bajaba.
+
+### Causa raíz
+Un nodo `If` evaluaba si la prioridad de la etiqueta era `'none'`:
+- TRUE (es none) → rama vacía (no hacía nada).
+- FALSE (no es none) → `actualizar_prioridad`.
+
+La intención era evitar mandar `priority: "none"` a Chatwoot (que da error). Pero el efecto
+colateral era que las etiquetas con prioridad `none` (como `lead-frio`) nunca actualizaban la
+prioridad, dejando el valor anterior.
+
+### Hallazgo técnico (Chatwoot API 4.14)
+- `PATCH /conversations/{id}` con `priority: null` → **200**, limpia la prioridad. ✅
+- `PATCH /conversations/{id}` con `priority: "none"` (string) → error. ❌
+- El valor `null` (JSON) es la forma correcta de quitar prioridad, no el string `"none"`.
+
+### Fix
+1. `actualizar_prioridad` ahora convierte `none`/vacío → `null` en el jsonBody:
+```
+"priority": {{ (() => { const p = (...).chatwoot_prioridad; return (!p || p === 'none') ? "null" : JSON.stringify(p); })() }}
+```
+2. Se eliminó el nodo `If` (quedó redundante: ya no hace falta filtrar `none`).
+   `actualizar_etiqueta` conecta directo a `actualizar_prioridad`, que ahora corre siempre y
+   refleja la prioridad real de la etiqueta actual (urgent/high/medium o limpia).
+
+### Validación
+Probado en vivo con conversación 161 (agencIA):
+- `exitoso` → prioridad urgent, seguimiento OFF.
+- Etiquetas intermedias → seguimiento ON (Bug 20).
+- `lead-frio` → seguimiento ON + prioridad limpiada (Bug 21).
+Los tres comportamientos correctos.
+
