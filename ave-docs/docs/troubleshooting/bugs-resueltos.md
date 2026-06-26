@@ -81,7 +81,7 @@ PG_get_empresa → If_conversacion_nueva → Chatwoot_inicializar_en_seguimiento
 
 **Lección:** Al insertar nodos en un flujo con un AI Agent, la entrada principal al agente debe ser una conexión única y limpia. La lógica adicional va en ramas paralelas, nunca convergiendo de vuelta a la entrada del agente.
 
-**Nota:** Hubo un intento previo de fix que cambió el `sessionKey` sin verificar primero cómo se generaba `session_id` — eso causó otro error ("No prompt specified") y tuvo que revertirse. Siempre verificar el origen real de un dato antes de cambiarlo.
+**Nota:** Hubo un intento previo de fix que cambió el `sessionKey` sin verificar primero cómo se generaba `session_id` — eso causó otro error ("No prompt specified") y tuvo que revertirse. Siempre verificar el origen real de un dato antes de cambiarlo. (Ver Bug 27, donde finalmente se resolvió el `session_id` correctamente.)
 
 ---
 
@@ -253,13 +253,11 @@ WHERE id = {{tbl_etiquetas_oper.updatedRow.id}};
 **Solución:** Insertar una lectura **fresca** del estado real en Chatwoot (`GET /conversations/{id}`, que captura cualquier cambio hecho por la tool en el mismo turno) justo antes de que `actualizar_estado_lead` reconstruya el custom attribute — usando ese valor fresco en vez del valor potencialmente desactualizado de Postgres. Se agregó además un nodo que sincroniza ese mismo valor fresco hacia Postgres, cerrando finalmente la sincronización tool↔base de datos que nunca había existido.
 
 **Lección crítica:** Cuando un valor se escribe en un sistema externo (Chatwoot) sin sincronizarlo a la base de datos propia, cualquier nodo posterior que "reconstruya el estado completo" usando la base de datos como fuente de verdad **revertirá silenciosamente** ese cambio externo, sin ningún error visible — porque desde la perspectiva de ese nodo, simplemente está haciendo su trabajo con los datos que tiene. La fuente de verdad real, en estos casos, debe ser el sistema que **acaba de cambiar** (Chatwoot, recién escrito por la tool), no la base de datos que aún no se enteró del cambio.
-
 ---
 
 # Bugs resueltos — Workflow AVE_Recordatorios_Automaticos (sesión 22 jun 2026)
 
-> Bloque a anexar a `docs/troubleshooting/bugs-resueltos.md`. Cubre los bugs 16 a 19,
-> todos en el workflow `AVE - Recordatorios Automaticos`.
+> Cubre los bugs 16 a 19, todos en el workflow `AVE - Recordatorios Automaticos`.
 
 ---
 
@@ -380,6 +378,10 @@ Cuando un nodo HTTP con `continueRegularOutput` falla, n8n **reemplaza el item p
 `error`** (no deja el payload vacío). Por eso la condición "¿existe `payload`?" detecta
 correctamente el fallo: el item fantasma no tiene `payload`, tiene `error`, y cae por FALSE.
 
+> Nota: el comportamiento de `PG_marcar_fantasma` se refinó después en el Bug 25 — un 404
+> transitorio ya no desactiva; solo se marca fantasma si `GET_estado_conversacion` confirma que
+> la conversación realmente no existe.
+
 ### Por qué `en_seguimiento_activo = false` y no `estado = 'cerrada'`
 Acción quirúrgica: solo apaga los recordatorios sin afectar otros procesos que leen `estado`
 (flujo principal, dashboard, reportes). Que una conversación se borre en Chatwoot significa
@@ -391,10 +393,11 @@ Probado con conversación real borrada en Chatwoot (chatwoot_conversation_id=100
 dio 404 → `If_conversacion_existe` la mandó por FALSE → `PG_marcar_fantasma` ejecutó con
 `success: true` → confirmado en BD `en_seguimiento_activo = false`.
 
+---
+
 # Bugs y cambios — Flujo principal agencIA (sesión 22 jun 2026, parte 2)
 
-> Bloque a anexar a `docs/troubleshooting/bugs-resueltos.md`. Cubre los bugs 20 y 21
-> y la migración de `es_conversion`, todos en el workflow `Flujo principal agencIA`.
+> Cubre los bugs 20 y 21 y la migración de `es_conversion`, en `Flujo principal agencIA`.
 
 ---
 
@@ -525,3 +528,209 @@ Probado en vivo con conversación 161 (agencIA):
 - `lead-frio` → seguimiento ON + prioridad limpiada (Bug 21).
 Los tres comportamientos correctos.
 
+---
+
+# Bugs resueltos — Validación desactivar_bot en recordatorios (sesión 23 jun 2026)
+
+> Bugs 22 a 26. Workflows: `AVE - Recordatorios Automaticos` y `Flujo principal agencIA`.
+> Contexto: al implementar que el workflow de recordatorios NO envíe a conversaciones con el bot
+> desactivado (validando contra Chatwoot, no solo Postgres), se destaparon varios bugs encadenados
+> que impedían que CUALQUIER recordatorio se enviara — uno tapaba al otro.
+
+---
+
+## Bug 22 — en_seguimiento nacía desincronizado en conversaciones nuevas
+
+**Workflow:** `Flujo principal agencIA`
+**Nodo:** `PG_upsert_conversacion`
+
+### Síntoma
+Conversaciones nuevas tenían `en_seguimiento = true` en Chatwoot pero `en_seguimiento_activo = false`
+en Postgres. Como el filtro de recordatorios lee Postgres, esas conversaciones nunca eran elegibles
+y no recibían recordatorios.
+
+### Causa raíz
+`Chatwoot_inicializar_en_seguimiento` ponía `en_seguimiento: true` en Chatwoot, pero el INSERT de
+`PG_upsert_conversacion` NO incluía la columna `en_seguimiento_activo`, así que quedaba en su default
+(`false`). Ambos lados nacían desincronizados.
+
+### Fix
+Agregar `en_seguimiento_activo = true` al INSERT (NO al `ON CONFLICT`, que se deja intacto para no
+reactivar el seguimiento de leads que ya convirtieron cuando vuelven a escribir).
+
+### Validación
+Conversación nueva 165 nació con `en_seguimiento_activo = true` sin UPDATE manual.
+
+---
+
+## Bug 23 — If_hay_pendientes fallaba por validación de tipo estricta
+
+**Workflow:** `AVE - Recordatorios Automaticos`
+**Nodos:** `If_hay_pendientes` (y por extensión los tres nodos `If`)
+
+### Síntoma
+El nodo fallaba con: `Wrong type: '38' is a number but was expecting a string [condition 0, item 0]`.
+El flujo se detenía ahí y NINGÚN recordatorio avanzaba. Este error estuvo oculto detrás de otros
+síntomas durante todo el diagnóstico.
+
+### Causa raíz
+La condición usaba operador tipo `string` / `notEmpty` con `typeValidation: strict`, pero
+`conversacion_id` llega como número (ej. 38). En modo strict, n8n rechaza la comparación.
+
+### Fix
+- `typeValidation: strict` → `loose` en los tres nodos If (`If_hay_pendientes`,
+  `If_conversacion_existe`, `If_bot_activo`).
+- `If_hay_pendientes`: operador `notEmpty` → `exists` (no depende del tipo; funciona con número o
+  string, y da false para el item vacío que emite "Always Output Data").
+
+---
+
+## Bug 24 — GET_historial con referencia $json rota tras insertar nodos intermedios
+
+**Workflow:** `AVE - Recordatorios Automaticos`
+**Nodo:** `GET_historial`
+
+### Síntoma
+`GET_historial` daba 404 SIEMPRE en la ejecución del workflow, aunque el mismo endpoint daba 200 por
+curl. Esto disparaba la lógica de "fantasma" y nada se enviaba. Fue la causa raíz real del
+"no llega el recordatorio".
+
+### Causa raíz
+La URL usaba `{{ $json.chatwoot_conversation_id }}`. Funcionaba cuando `GET_historial` recibía directo
+el item de `Loop_conversaciones`. Pero al insertar `GET_estado_conversacion` + `If_bot_activo` en
+medio, el `$json` que llega a `GET_historial` pasó a ser la **respuesta de Chatwoot** (estructura
+`meta`/`id`/`custom_attributes`), que NO tiene el campo `chatwoot_conversation_id`. La referencia
+resolvía a vacío → URL malformada → 404.
+
+### Fix
+Referencia explícita al nodo correcto:
+```
+{{ $('Loop_conversaciones').item.json.chatwoot_conversation_id }}
+```
+
+### Lección
+Refuerza Bug 13 y 14: al insertar nodos en medio de un flujo, las referencias `$json` (que apuntan al
+nodo inmediatamente anterior) se rompen silenciosamente. Para datos que vienen de un nodo específico,
+usar referencias explícitas `$('NombreNodo').item.json.campo`, no `$json`.
+
+---
+
+## Bug 25 — PG_marcar_fantasma desactivaba conversaciones válidas por 404 transitorio
+
+**Workflow:** `AVE - Recordatorios Automaticos`
+**Nodos:** `If_conversacion_existe`, nuevo `If_estado_existe`
+
+### Síntoma
+Un 404 puntual de `GET_historial` (incluso transitorio, por timing o conversación recién creada)
+hacía que `If_conversacion_existe` mandara la conversación a `PG_marcar_fantasma`, desactivándola
+(`en_seguimiento_activo = false`) permanentemente. Conversaciones válidas quedaban desactivadas por
+un error temporal.
+
+### Causa raíz
+La detección de "fantasma" recaía en `GET_historial` (`/messages`), que puede dar 404 transitorio.
+Un solo 404 no debería significar "conversación borrada para siempre".
+
+### Fix
+Mover la detección de fantasma real al endpoint `/conversations/{id}` (`GET_estado_conversacion`),
+que es la fuente de verdad sobre existencia. Nuevo nodo `If_estado_existe`:
+```
+GET_estado_conversacion → If_estado_existe
+   ├─ EXISTE (custom_attributes presente) → If_bot_activo → ... → GET_historial → If_conversacion_existe
+   │                                                                  ├─ tiene payload → envía
+   │                                                                  └─ 404 transitorio → vuelve al loop (NO desactiva)
+   └─ NO EXISTE (404 real) → PG_marcar_fantasma
+```
+Solo se marca fantasma si la conversación realmente no existe. Un 404 de `/messages` con la
+conversación existente salta el envío y reintenta en el próximo ciclo, sin desactivar.
+
+---
+
+## Bug 26 — Validación de desactivar_bot fresco en recordatorios (mejora doble capa)
+
+**Workflow:** `AVE - Recordatorios Automaticos`
+**Nodos nuevos:** `GET_estado_conversacion`, `If_bot_activo`, `PG_sync_desactivar_bot`
+
+### Problema
+Si un humano desactivaba el bot manualmente en Chatwoot, Postgres podía quedar desfasado
+(`desactivar_bot = false`), y el recordatorio se enviaba pese al bot desactivado. Mismo patrón de
+desfase que el Bug 15.
+
+### Solución (doble capa)
+1. **Filtro Postgres** (`PG_get_conversaciones_pendientes`): `AND c.desactivar_bot = false`. Primera
+   barrera eficiente — si Postgres ya está sincronizado, la conversación ni entra al loop.
+2. **Validación fresca** (`GET_estado_conversacion` + `If_bot_activo`): lee `desactivar_bot` real de
+   Chatwoot. Si está desactivado → `PG_sync_desactivar_bot` actualiza Postgres a `true` y NO envía.
+   Atrapa el caso de desfase y de paso lo corrige para el futuro.
+
+### Validación (3 casos)
+- Bot activo + en seguimiento (conv 163) → **envía** ✅
+- Bot desactivado en Postgres (conv 164) → bloqueado por filtro inicial, no envía ✅
+- Bot desactivado solo en Chatwoot, Postgres desfasado (conv 161) → GET fresco lo detecta, no envía
+  + sincroniza Postgres ✅
+
+### Nota
+La validación fresca consume un GET extra a Chatwoot por conversación pendiente; como el filtro de
+Postgres descarta la mayoría, el costo es bajo. Todos los nodos HTTP nuevos tienen "Continue On Fail".
+
+---
+
+# Bug 27 — Colisión de memoria entre empresas por session_id sin account_id (sesión 25 jun 2026)
+
+**Workflow:** `Flujo principal agencIA`
+**Nodo:** `Contexto` (Set) → consumido por `Postgres Chat Memory`
+**Resuelve el riesgo #3 que estaba pendiente en la documentación de arquitectura.**
+
+### Síntoma
+El bot a veces respondía con la identidad de la empresa equivocada (el agente de Uhane respondía como
+si fuera agencIA) y, en un caso, saludó a un usuario con el nombre de otra persona ("Idier Loiza") de
+una conversación distinta. Comportamiento **intermitente**.
+
+### Causa raíz
+La memoria conversacional (tabla `n8n_chat_histories`) se indexa por `session_id`, generado en el
+nodo `Contexto` **solo con el `conversation_id`** de Chatwoot:
+```
+session_id = {{ $('Webhook').item.json.body.conversation.id }}
+```
+Cada cuenta de Chatwoot numera sus conversaciones de forma independiente. La conversación 103 de
+agencIA (account 1) y la 103 de Uhane (account 3) generaban el mismo `session_id = 103` →
+**compartían memoria**. El agente leía el historial de la otra empresa y heredaba su contexto. El
+carácter intermitente se explica porque solo colisiona cuando dos conversaciones de empresas
+distintas coinciden en número.
+
+### Confirmación en datos
+```sql
+SELECT DISTINCT session_id FROM n8n_chat_histories ORDER BY session_id;
+```
+Mostraba mayoría de IDs "pelados" (`100`, `101`, `103`...) sin prefijo de cuenta.
+
+### Fix (dos partes)
+En el nodo `Contexto`, campo `session_id`:
+1. **Valor** → combinar cuenta + conversación:
+   ```
+   session_id = {{ $('Webhook').item.json.body.account.id }}_{{ $('Webhook').item.json.body.conversation.id }}
+   ```
+2. **Tipo de campo** → cambiar de **Number** a **String**.
+
+> El punto 2 es crítico y es la razón por la que un intento anterior falló y tuvo que revertirse
+> (relacionado con la nota del Bug 4): con el campo tipado como Number, n8n rechazaba `1_168` con el
+> error `'session_id' expects a number but we got '1_168'`, que aguas abajo se manifestaba como
+> "No prompt specified". Cambiar el tipo a String lo resuelve.
+
+Resultado: agencIA → `1_168`, Uhane → `3_111`. Memorias aisladas por empresa.
+
+### Limpieza de memoria colisionada
+Como el sistema estaba **pre-producción**, se vació la tabla para eliminar historiales ya
+colisionados y arrancar limpio:
+```sql
+TRUNCATE TABLE n8n_chat_histories;
+```
+
+### Validación
+1. `SELECT DISTINCT session_id ...` → solo formatos `cuenta_conversacion` (`1_168`, `3_111`). ✅
+2. Prueba funcional: nombre distinto en cada empresa, luego "¿cómo me llamo?" en cada una → cada
+   empresa recuerda el nombre correcto, sin cruces. ✅
+
+### Lección
+El `session_id` de memoria en un sistema multi-tenant DEBE incluir el identificador de tenant
+(`account_id`), no solo el `conversation_id`. Y en nodos Set de n8n, un campo con valor compuesto
+(con separadores como guion bajo) debe tiparse como String, no Number.
