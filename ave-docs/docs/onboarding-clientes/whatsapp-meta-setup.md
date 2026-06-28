@@ -1,264 +1,206 @@
-# Guía de Integración: WhatsApp Business API + Chatwoot
-
-Proceso completo desde cero para crear una app de WhatsApp Business y conectarla con Chatwoot, incluyendo los errores más frecuentes encontrados durante la implementación y sus soluciones. **Aplica para cada cliente nuevo que se incorpore al sistema AVE.**
-
-| Versión | Fecha | Plataforma |
-|---|---|---|
-| 1.0 | Junio 2026 | Chatwoot 4.14 |
+# Guía de Conexión WhatsApp Business API + Chatwoot — AVE
+*Versión 2.0 — actualizada jun 2026 con lecciones de Uhane y PC Outlet*
 
 ---
 
-## Prerrequisitos
+## ⚠️ Orden crítico de configuración
 
-- Cuenta de Facebook activa con verificación en 2 pasos.
-- Acceso a Meta Business Suite (`business.facebook.com`).
-- Acceso a Meta for Developers (`developers.facebook.com`).
-- Chatwoot instalado y funcionando.
-- Número de teléfono disponible (sin WhatsApp instalado).
+El orden importa. Si se intenta registrar el número antes de crear el inbox en Chatwoot, el registro falla con error genérico sin explicación clara.
 
-⚠️ **Sobre el número de teléfono:** el número que uses **no puede tener WhatsApp instalado actualmente**. Si lo tiene, debes desregistrarlo primero desde la app antes de continuar. Se recomienda usar una SIM nueva o un número virtual dedicado.
+### Orden correcto (probado y validado):
 
----
-
-## Paso 1 — Crear página de Facebook
-
-Meta requiere una página de Facebook activa para asociarla a la cuenta de WhatsApp Business.
-
-| # | Instrucción |
-|---|---|
-| 1 | Ve a `facebook.com` e inicia sesión con tu cuenta. |
-| 2 | En el menú izquierdo busca "Páginas" → "Crear nueva página". |
-| 3 | Ingresa el nombre del negocio o cliente. |
-| 4 | Selecciona la categoría más cercana al tipo de negocio. |
-| 5 | Clic en "Crear" y completa la información básica. |
+1. Crear portfolio empresarial en Meta (si no existe)
+2. Crear app bajo ese portfolio
+3. Crear usuario del sistema en Business Manager
+4. Asignar la app al usuario del sistema
+5. Generar token permanente
+6. Agregar método de pago en Meta
+7. **Crear inbox en Chatwoot PRIMERO** ← crítico
+8. Configurar webhook en Meta con URL y token de Chatwoot
+9. **Activar campo `messages`** en Campos de webhook ← crítico
+10. Registrar el número en Meta → Paso 2
 
 ---
 
-## Paso 2 — Crear app en Meta for Developers
+## PASO 1 — Portfolio empresarial en Meta
 
-| # | Instrucción |
-|---|---|
-| 1 | Ve a `developers.facebook.com` e inicia sesión. |
-| 2 | Clic en "Mis apps" → "Crear app". |
-| 3 | En "Casos de uso" selecciona "Conectarte con los clientes a través de WhatsApp" y clic en Siguiente. |
-| 4 | En "Negocio" selecciona el portfolio comercial existente o crea uno nuevo con "Crear un portfolio comercial". |
-| 5 | Si creas un portfolio nuevo: en el popup selecciona "Verificar más tarde" (no es necesario para pruebas). |
-| 6 | En "Requisitos" clic en Siguiente (normalmente no hay requisitos pendientes). |
-| 7 | Revisa el resumen y clic en "Crear app". |
+`business.facebook.com` → Configuración → crear o verificar portfolio.
 
-⚠️ **Si creas un portfolio comercial nuevo:** aparecerán opciones para verificar el negocio. Selecciona "Verificar más tarde" — puedes verificarlo después. La verificación es necesaria solo para enviar mensajes a usuarios fuera de tu lista de prueba.
+Cada cliente debe tener su propio portfolio. La app debe crearse **bajo el portfolio del cliente**, no bajo una cuenta personal.
 
 ---
 
-## Paso 3 — Configurar WhatsApp en la app
+## PASO 2 — Crear app en Meta for Developers
 
-### 3.1 Activar caso de uso WhatsApp
+`developers.facebook.com` → Mis aplicaciones → Crear app
 
-| # | Instrucción |
-|---|---|
-| 1 | Dentro de la app, ve a "Casos de uso" en el menú izquierdo. |
-| 2 | Clic en "Personalizar" del caso "Conectar en WhatsApp". |
-| 3 | Selecciona el portfolio comercial del cliente y clic en "Continuar". |
-| 4 | Selecciona "Integrar con la API" como tipo de integración. |
+- Caso de uso: **"Conectarte con los clientes a través de WhatsApp"**
+- **Portfolio:** seleccionar el portfolio del cliente ← paso crítico
+- Nombre: `{cliente}-wa` (ej: `pcoutlet-wa`, `uhane-wa`)
+- Correo: correo del cliente
 
-### 3.2 Registrar número de teléfono
+---
 
-| # | Instrucción |
-|---|---|
-| 1 | Ve a "Paso 2: Configuración de producción" en el menú izquierdo. |
-| 2 | Expande "Registra tu número de teléfono de WhatsApp". |
-| 3 | Activa el toggle "Suscribir webhooks" — debe quedar en **azul/verde**. |
-| 4 | Clic en "Registrar" al lado del número. |
-| 5 | Anota los datos que aparecen: **Phone Number ID** e **WhatsApp Business Account ID**. |
+## PASO 3 — Crear usuario del sistema
 
-📌 **Guarda estos datos — los necesitarás en Chatwoot:**
+`business.facebook.com` → portfolio del cliente → Configuración → Usuarios → Usuarios del sistema → **+ Añadir**
+
+- Nombre: `system-user`
+- Rol: **Administrador**
+
+---
+
+## PASO 4 — Asignar la app al usuario del sistema
+
+⚠️ Este paso es el que más confunde. El camino correcto es:
+
+`Usuarios del sistema` → selecciona el usuario → clic en **tres puntos `...`** → **"Asignar activos"** → categoría **"Aplicaciones"** → selecciona la app del cliente → activa **"Administrar la aplicación" (Acceso total)** → clic en **"Asignar activos"**
+
+❌ No usar el botón "Conectar activos" desde la app — ese solo muestra cuentas publicitarias.
+
+---
+
+## PASO 5 — Generar token permanente
+
+`Usuarios del sistema` → selecciona el usuario → clic en **"Generar identificador"**
+
+- Seleccionar la app del cliente
+- Establecer caducidad: **Nunca**
+- Permisos requeridos:
+  - ✅ `whatsapp_business_messaging`
+  - ✅ `whatsapp_business_management`
+
+**⚠️ Copiar y guardar el token inmediatamente** — no se vuelve a mostrar completo.
+
+Guardar en:
+- `empresas.chatwoot_api_key` en la BD de AVE
+- Lugar seguro del cliente
+
+---
+
+## PASO 6 — Agregar método de pago en Meta
+
+`business.facebook.com` → portfolio del cliente → Facturación → **Cuentas de WhatsApp Business** → Añadir método de pago
+
+Sin método de pago el registro del número falla con error genérico.
+
+---
+
+## PASO 7 — Crear inbox en Chatwoot ← ANTES de registrar el número
+
+Chatwoot → cuenta del cliente → Ajustes → Entradas → Añadir bandeja de entrada → WhatsApp → **WhatsApp Cloud**
 
 | Campo | Valor |
 |---|---|
-| Phone Number ID | Aparece al lado del número registrado. |
-| WhatsApp Business Account ID | Aparece en el encabezado de la sección. |
-| Número de teléfono | El número que registraste (ej. `+57 322 2752524`). |
+| Nombre | `{cliente}-produccion` |
+| Número de teléfono | `+57XXXXXXXXXX` (con código de país, sin espacios) |
+| ID de número de teléfono | Phone Number ID de Meta |
+| ID de cuenta de negocio | WhatsApp Business Account ID de Meta |
+| Clave de API | Token del sistema (paso 5) |
+
+Al guardar, Chatwoot genera:
+- **URL del webhook** → copiar
+- **Token de verificación** → copiar
 
 ---
 
-## Paso 4 — Generar token de usuario del sistema
+## PASO 8 — Configurar webhook en Meta
 
-⚠️ **Por qué no usar el token permanente de Developers:** el token que genera Meta for Developers está vinculado a tu usuario personal de Facebook. Chatwoot requiere un **token de usuario del sistema** (System User Token). Si usas el token personal obtendrás el error *"Provider config Invalid Credentials"*. Siempre usa el token de usuario del sistema para integraciones con Chatwoot.
-
-### 4.1 Crear usuario del sistema
-
-| # | Instrucción |
-|---|---|
-| 1 | Ve a `business.facebook.com`. |
-| 2 | Selecciona tu portfolio comercial. |
-| 3 | Ve a Configuración → Usuarios → Usuarios del sistema. |
-| 4 | Si no hay usuarios, clic en "+ Agregar" y crea uno con rol **Administrador**. |
-| 5 | Si ya existe un usuario tipo "Employee", puedes usarlo. |
-
-### 4.2 Asignar cuenta de WhatsApp al usuario
-
-| # | Instrucción |
-|---|---|
-| 1 | Selecciona el usuario del sistema en la lista. |
-| 2 | Clic en "Administrar activos" o los tres puntos "..." → editar. |
-| 3 | En "Cuentas de WhatsApp" selecciona la cuenta del negocio. |
-| 4 | En permisos selecciona "Control total" → "Todo". |
-| 5 | Clic en "Asignar activos". |
-
-### 4.3 Generar token permanente
-
-| # | Instrucción |
-|---|---|
-| 1 | Con el usuario seleccionado, clic en "Generar token". |
-| 2 | Selecciona la app del cliente. |
-| 3 | En caducidad selecciona **"Nunca"**. |
-| 4 | En permisos activa: `whatsapp_business_messaging` y `whatsapp_business_management`. |
-| 5 | Clic en "Generar token". |
-| 6 | **Copia y guarda el token** — no volverá a mostrarse completo. |
-
-🔒 **Guarda el token de inmediato:** el token solo se muestra una vez de forma completa. Guárdalo en un lugar seguro como un gestor de contraseñas. Si lo pierdes deberás revocar el token y generar uno nuevo.
-
----
-
-## Paso 5 — Crear inbox en Chatwoot
-
-| # | Instrucción |
-|---|---|
-| 1 | Ve a Chatwoot → Ajustes → Entradas → Añadir bandeja de entrada. |
-| 2 | Selecciona "WhatsApp" como canal. |
-| 3 | Selecciona "WhatsApp Cloud" como proveedor. |
-| 4 | Llena los campos con los datos de Meta (ver tabla abajo). |
-| 5 | Clic en "Crear canal de WhatsApp". |
-| 6 | Chatwoot mostrará la URL del webhook — **cópiala**. |
-
-📌 **Datos requeridos para el inbox:**
+`developers.facebook.com` → app del cliente → Casos de uso → Personalizar → **Configuración** → sección Webhook
 
 | Campo | Valor |
 |---|---|
-| Nombre | Nombre descriptivo (ej. `iden-produccion`). |
-| Número de teléfono | Formato internacional, ej. `+57 322 2752524`. |
-| ID de número de teléfono | Phone Number ID de Meta for Developers. |
-| ID de cuenta de negocio | WhatsApp Business Account ID de Meta. |
-| Clave de API | Token del usuario del sistema (Paso 4.3). |
+| URL de devolución de llamada | URL que dio Chatwoot |
+| Identificador de verificación | Token que dio Chatwoot |
+
+Clic en **"Verificar y guardar"**.
+
+La URL tiene este formato:
+```
+https://chatwoot.identechnology.co/webhooks/whatsapp/+57XXXXXXXXXX
+```
 
 ---
 
-## Paso 6 — Configurar webhook en Meta
+## PASO 9 — Activar campo `messages` ← EL MÁS OLVIDADO
 
-| # | Instrucción |
-|---|---|
-| 1 | Ve a Meta for Developers → tu app → Casos de uso → Personalizar WhatsApp. |
-| 2 | Ve a "Paso 2: Configuración de producción". |
-| 3 | Expande "Configurar webhooks". |
-| 4 | En "URL de devolución de llamada" pega la URL que te dio Chatwoot. |
-| 5 | En "Token de verificación" pega el token que te dio Chatwoot. |
-| 6 | Clic en "Verificar y guardar". |
-| 7 | Si es exitoso, Meta redirige a "Permisos y funciones". |
+En la misma pantalla de Configuración → sección **"Campos de webhook"** → buscar el campo **`messages`** → activar el toggle para suscribirse.
 
-La URL del webhook de Chatwoot tiene este formato:
-```
-https://chatwoot.tudominio.co/webhooks/whatsapp/+NUMERODETELEFONO
-```
+**Sin este paso los mensajes NO llegan a Chatwoot aunque el webhook esté verificado.**
 
-⚠️ **Error frecuente — webhook no verifica:** si la verificación falla, revisa que la URL de Chatwoot sea accesible desde internet, que el token de verificación sea exactamente el que muestra Chatwoot, y que Chatwoot esté corriendo sin errores.
+Todos los campos vienen en "Suscripción cancelada" por defecto.
 
 ---
 
-## Paso 7 — Configurar webhook en Chatwoot para n8n
+## PASO 10 — Registrar el número en Meta
 
-| # | Instrucción |
+`developers.facebook.com` → app del cliente → Paso 2. Configuración de producción → activar toggle **"Suscribirse a webhooks"** → clic en **"Registrarte"**
+
+Si el número queda como "Registrado" → ✅ listo.
+
+---
+
+## PASO 11 — Webhook Chatwoot → n8n
+
+⚠️ Este paso solo se hace UNA vez por cuenta de Chatwoot, no por cada cliente.
+
+Chatwoot → cuenta del cliente → Ajustes → Integraciones → Webhooks → Añadir nuevo webhook
+
+| Campo | Valor |
 |---|---|
-| 1 | Ve a Chatwoot → Ajustes → Integraciones → Webhooks. |
-| 2 | Clic en "Añadir nuevo webhook". |
-| 3 | URL: `https://hn8n.tudominio.co/webhook/chatwoot`. |
-| 4 | Eventos: marca **"Mensaje creado"**. |
-| 5 | Clic en "Guardar". |
+| URL | `https://hn8n.identechnology.co/webhook/chatwoot` |
+| Eventos | ✅ Mensaje creado |
 
-Con esto, cada mensaje que llegue al inbox de WhatsApp se enviará automáticamente a n8n para que el bot lo procese.
+Si la cuenta ya tiene este webhook configurado (de un inbox anterior), no crear uno nuevo.
+
+---
+
+## PASO 12 — Registrar token en la BD de AVE
+
+```sql
+UPDATE empresas
+SET chatwoot_api_key = '[token_sistema]'
+WHERE id = [empresa_id];
+
+SELECT id, nombre, chatwoot_account_id, chatwoot_url 
+FROM empresas WHERE id = [empresa_id];
+```
+
+---
+
+## Datos a anotar por cliente
+
+| Campo | Dónde encontrarlo |
+|---|---|
+| Phone Number ID | developers → app → Configuración → Números de teléfono |
+| WhatsApp Business Account ID | developers → app → Paso 2 → debajo del nombre de la cuenta |
+| Token del sistema | Business Manager → Usuarios del sistema → Generar identificador |
+| URL webhook Chatwoot | Chatwoot → inbox → Configuración → Token de verificación |
+| Token verificación Chatwoot | Chatwoot → inbox → Configuración → Token de verificación |
 
 ---
 
 ## Errores frecuentes y soluciones
 
-### Error: "Provider config Invalid Credentials"
-
-**Causa:** se usó el token permanente de Meta for Developers en lugar del token de usuario del sistema. El token personal de Facebook no tiene los permisos correctos para Chatwoot.
-
-**Solución:** generar y usar el token de usuario del sistema (ver Paso 4).
-
-### Error: El número no tiene WhatsApp
-
-**Causa:** el número está registrado en WhatsApp Business API pero no en la app de WhatsApp normal. Esto es **normal** — la Cloud API no funciona como una app de WhatsApp convencional.
-
-**Solución:**
-- Para recibir mensajes de prueba, usa el código QR que aparece en Meta for Developers → Paso 2 → "Prueba tu número registrado".
-- Escanea el QR con tu celular para abrir WhatsApp y enviar un mensaje al número registrado.
-- También puedes agregar números de prueba en la sección correspondiente de Meta for Developers.
-
-### Error: Webhook no verifica en Meta
-
-**Causa:** la URL de Chatwoot no es accesible desde internet, o el token no coincide.
-
-**Solución:**
-- Verifica que Chatwoot esté corriendo: `curl https://chatwoot.tudominio.co/auth/sign_in`.
-- Copia exactamente la URL y el token que muestra Chatwoot al crear el inbox.
-- Asegúrate de no tener espacios extra al pegar los valores.
-
-### Error: Mensajes no llegan a Chatwoot
-
-**Causa:** el webhook de n8n no está activo, o el webhook de Chatwoot hacia n8n no está configurado.
-
-**Solución:**
-- Verifica que el workflow de n8n esté en estado **"Published"** (no draft).
-- Revisa Chatwoot → Integraciones → Webhooks que la URL de n8n esté correcta.
-- En Meta for Developers verifica que "Suscribir webhooks" esté activo (toggle azul).
-- Revisa los logs de n8n en Executions para ver si hay errores.
+| Error | Causa | Solución |
+|---|---|---|
+| "Se ha producido un error durante el registro" | Cuenta de Facebook con restricciones activas | Revisar `facebook.com/accountquality` |
+| "Se ha producido un error durante el registro" | Número con WhatsApp instalado | Desinstalar WhatsApp y eliminar cuenta primero |
+| "Se ha producido un error durante el registro" | Sin método de pago en Meta | Agregar tarjeta en Facturación → Cuentas de WhatsApp Business |
+| "No hay permisos disponibles" al generar token | App no asignada al usuario del sistema | BM → Usuarios del sistema → tres puntos → Asignar activos → Aplicaciones |
+| "Provider config Invalid Credentials" en Chatwoot | Token personal en lugar de token del sistema | Generar token desde BM → Usuarios del sistema |
+| "Phone number has already been taken" en Chatwoot | Inbox ya existe de sesión anterior | Usar el inbox existente, no crear uno nuevo |
+| Mensajes no llegan a Chatwoot | Campo `messages` no suscrito en Meta | Activar `messages` en Campos de webhook |
+| Mensajes llegan a Chatwoot pero bot no responde | Workflow n8n no está activo | Verificar que Bot_Agencia_final esté en Published |
+| Mensajes llegan a Chatwoot pero bot no responde | Webhook Chatwoot → n8n no configurado | Ajustes → Integraciones → Webhooks → verificar URL de n8n |
 
 ---
 
-## Checklist de verificación
+## Clientes configurados
 
-Usa esta lista para confirmar que todo está correctamente configurado.
-
-**Meta for Developers**
-- [ ] App creada con caso de uso WhatsApp.
-- [ ] Portfolio comercial asociado.
-- [ ] Número de teléfono registrado (estado: "Registrado" en verde).
-- [ ] "Suscribir webhooks" activado (toggle azul).
-- [ ] Webhook URL de Chatwoot configurado y verificado.
-
-**Business Manager**
-- [ ] Usuario del sistema creado con rol Administrador.
-- [ ] Cuenta de WhatsApp asignada al usuario con Control total.
-- [ ] Token permanente generado con permisos `whatsapp_business_messaging` y `whatsapp_business_management`.
-- [ ] Token guardado en lugar seguro.
-
-**Chatwoot**
-- [ ] Inbox WhatsApp Cloud creado con token del sistema.
-- [ ] Phone Number ID correcto.
-- [ ] Business Account ID correcto.
-- [ ] Webhook de n8n configurado en Integraciones → Webhooks.
-
-**n8n**
-- [ ] Workflow `Bot_Agencia_final` en estado Published.
-- [ ] Webhook de Chatwoot apuntando a la URL correcta de n8n.
-- [ ] Prueba exitosa: mensaje enviado y respondido por el bot.
-
----
-
-## Datos a registrar por cada cliente
-
-Al completar el proceso para un nuevo cliente, registra estos datos en la base de datos (tabla `empresas`):
-
-| Campo | Valor |
-|---|---|
-| `chatwoot_account_id` | ID de la cuenta en Chatwoot (se ve en la URL). |
-| `chatwoot_api_key` | Token del usuario del sistema de Meta. |
-| `chatwoot_url` | URL de Chatwoot (ej. `https://chatwoot.tudominio.co`). |
-| Phone Number ID | ID del número en Meta for Developers. |
-| WhatsApp Business Account ID | ID de la cuenta de negocio en Meta. |
-| Número de teléfono | Formato `+57XXXXXXXXXX`. |
-
----
-
-*AVE — identechnology.co · Junio 2026*
+| Cliente | empresa_id | account_id | Número | Estado |
+|---|---|---|---|---|
+| agencIA | 1 | 1 | +57... | ✅ Activo |
+| Uhane SAS | 7 | 3 | +573170997828 | ✅ Activo jun 2026 |
+| PC Outlet | 8 | 4 | +573023371255 | ⏳ Pendiente token |
+| Tienda Virtual 4030 | 9 | - | - | ⏳ Pendiente WhatsApp |
