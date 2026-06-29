@@ -734,3 +734,104 @@ TRUNCATE TABLE n8n_chat_histories;
 El `session_id` de memoria en un sistema multi-tenant DEBE incluir el identificador de tenant
 (`account_id`), no solo el `conversation_id`. Y en nodos Set de n8n, un campo con valor compuesto
 (con separadores como guion bajo) debe tiparse como String, no Number.
+
+# Bug 28 - FilePicker Appsmith — archivo equivocado y extensión incorrecta en modo Binary
+
+**Fecha:** 2026-06-29  
+**Estado:** ✅ Resuelto  
+**Afecta:** Módulo `servicios_media` — subida de video y PDF desde Appsmith
+
+---
+
+## Síntomas
+
+1. `Cannot read properties of null (reading 'size')` al intentar subir un video por primera vez
+2. Video se guardaba con extensión `.pdf` en lugar de `.mp4`
+3. Al subir un video después de haber subido un PDF, Appsmith enviaba el PDF anterior en lugar del video seleccionado
+
+---
+
+## Causa raíz
+
+Appsmith en modo `Binary` tiene dos comportamientos problemáticos:
+
+- `files[0]` retorna `null` cuando el FilePicker no ha sido usado previamente en la sesión — causa el error `null (reading 'size')`
+- El archivo en memoria no se limpia correctamente entre subidas — Appsmith reutiliza el último archivo procesado aunque el usuario haya seleccionado uno nuevo
+- El `originalname` del archivo llega vacío o incorrecto al backend en modo Binary, lo que causa que multer no pueda determinar la extensión correcta
+
+---
+
+## Fix aplicado
+
+### 1. Cambiar Data format de Binary a Base64 en los tres FilePickers
+
+| Widget | Antes | Después |
+|--------|-------|---------|
+| `fp_imagen` | Binary | Base64 |
+| `fp_video` | Binary | Base64 |
+| `fp_pdf` | Binary | Base64 |
+
+Con Base64 Appsmith mantiene correctamente el archivo seleccionado sin confundirse con archivos anteriores.
+
+### 2. Extensión por defecto en `makeStorage` — API
+
+Se agregó un fallback de extensión en `media.service.js` para cuando el `originalname` llega sin extensión:
+
+```javascript
+const DEFAULT_EXT = { imagenes: '.jpg', videos: '.mp4', pdfs: '.pdf' };
+
+function makeStorage(subdir) {
+  return multer.diskStorage({
+    destination: (req, file, cb) => {
+      const dir = path.join(MEDIA_DIR, req.params.empresa_id, subdir);
+      fs.mkdirSync(dir, { recursive: true });
+      cb(null, dir);
+    },
+    filename: (req, file, cb) => {
+      const extFromName = path.extname(file.originalname || '').toLowerCase();
+      const ext = extFromName || DEFAULT_EXT[subdir] || '.bin';
+      const filename = req.params.servicio_id + '_' + Date.now() + ext;
+      cb(null, filename);
+    },
+  });
+}
+```
+
+### 3. Reset widget en onSuccess de cada FilePicker
+
+Se agregó `Reset widget` al callback onSuccess de los tres FilePickers para limpiar el estado después de cada subida:
+
+- `fp_imagen` onSuccess → `get_media_servicio` + `Show alert` + `Reset widget fp_imagen`
+- `fp_video` onSuccess → `get_media_servicio` + `Show alert` + `Reset widget fp_video`
+- `fp_pdf` onSuccess → `get_media_servicio` + `Show alert` + `Reset widget fp_pdf`
+
+### 4. fileFilter del video sin validación de mimetype
+
+Appsmith en modo Base64 puede enviar el video con mimetype incorrecto (`application/pdf`). El fileFilter del video se dejó sin validación — la ruta `/upload/video/` ya es suficiente control de acceso:
+
+```javascript
+exports.uploadVideo = multer({
+  storage: makeStorage('videos'),
+  fileFilter: (req, file, cb) => {
+    cb(null, true);
+  },
+  limits: { fileSize: 100 * 1024 * 1024 },
+});
+```
+
+---
+
+## Commit
+
+```
+fix: extensión por defecto en makeStorage según tipo de media — workaround Appsmith Base64
+fix: fileFilter video sin validación mimetype — bug Appsmith Binary mode
+```
+
+---
+
+## Notas
+
+- Este comportamiento es específico de Appsmith con archivos binarios grandes
+- La validación de tipo de archivo para videos queda como deuda técnica — se puede resolver en el futuro con un middleware personalizado antes de multer que lea el header `Content-Type` del navegador
+- Para imágenes y PDFs la validación por extensión sí funciona correctamente
