@@ -835,3 +835,203 @@ fix: fileFilter video sin validación mimetype — bug Appsmith Binary mode
 - Este comportamiento es específico de Appsmith con archivos binarios grandes
 - La validación de tipo de archivo para videos queda como deuda técnica — se puede resolver en el futuro con un middleware personalizado antes de multer que lea el header `Content-Type` del navegador
 - Para imágenes y PDFs la validación por extensión sí funciona correctamente
+
+
+
+# Bugs resueltos — Multi-tenant OpenAI y sistema de notificaciones (sesión 03 jul 2026)
+
+> Cubre los bugs 29 a 34. Workflow: `Flujo principal agencIA`.
+> Contexto: refactor del flujo para que cada empresa use su propia API key de OpenAI en lugar de una compartida (multi-tenant real), incluyendo el nodo de transcripción Whisper. Como parte del mismo refactor se agregó un sistema de detección + notificación cuando la key de un tenant falta o es inválida (nota privada en Chatwoot, correos al admin y al cliente, con anti-flood). Los bugs 29 a 31 aparecieron durante la integración; los bugs 32 a 34 se descubrieron durante las pruebas de aceptación del sistema de notificaciones.
+
+---
+
+## Bug 29 — Nodo Postgres intermedio corta la cadena binaria en la rama de transcripción de audio
+
+**Workflow:** `Flujo principal agencIA`
+**Nodos:** `PG_get_openai_key_audio` (nuevo), `Descargar_Audio`, `Transcribir`
+
+### Síntoma
+Al probar la transcripción de una nota de voz por WhatsApp, el nodo `Transcribir` (HTTP Request a la API de Whisper) fallaba con:
+```
+This operation expects the node's input data to contain a binary file 'data', but none was found [item 0]
+```
+
+### Causa raíz
+Para hacer multi-tenant la transcripción con Whisper, se agregó un nodo Postgres `PG_get_openai_key_audio` que lee la `openai_api_key` de la empresa desde `bot_config`, y se ubicó **entre** `Descargar_Audio` y `Transcribir`:
+```
+Descargar_Audio (binary: data)
+    ↓
+PG_get_openai_key_audio (SOLO JSON, sin binary)   ← corta la cadena
+    ↓
+Transcribir (binary "data" no llega)  → 💥
+```
+Los nodos Postgres en n8n **no propagan datos binarios**, solo JSON. Al insertar uno en medio de una cadena que transporta un archivo binario, el binario se pierde silenciosamente en el paso intermedio.
+
+### Fix
+Reubicar el nodo Postgres **antes** de `Descargar_Audio`:
+```
+Switch (AUDIO)
+    ↓
+PG_get_openai_key_audio (obtiene la key como JSON)
+    ↓
+Descargar_Audio (produce binary: data)
+    ↓
+Transcribir (recibe binary directo, y usa la key via referencia por nombre)
+```
+La expresión del header `Authorization` en `Transcribir` sigue funcionando porque referencia el nodo por nombre (`$('PG_get_openai_key_audio').item.json.openai_api_key`), no por posición.
+
+### Lección
+En n8n, los nodos que **no procesan binarios** (Postgres, Set, Code sin manejo explícito de `$binary`, Merge sin configuración binary) **cortan la cadena binaria** silenciosamente. Regla operativa para audio, imágenes o archivos: los metadatos JSON van por un lado, los binarios por otro; nunca insertar un nodo "solo JSON" en medio de la cadena binaria. Si necesita un dato JSON adicional, obténgalo antes del nodo que produce el binario, no después.
+
+---
+
+## Bug 30 — `$json` roto en `Descargar_Audio` tras insertar nodo intermedio (recurrencia del Bug 24)
+
+**Workflow:** `Flujo principal agencIA`
+**Nodo:** `Descargar_Audio`
+
+### Síntoma
+Tras aplicar el fix del Bug 29 (mover `PG_get_openai_key_audio` antes de `Descargar_Audio`), el flujo pasó del error de binario a este error nuevo:
+```
+URL parameter must be a string, got undefined
+```
+
+### Causa raíz
+La URL de `Descargar_Audio` usaba `{{ $json.body.conversation.messages[0].attachments[0].data_url }}`. Antes del refactor, `Descargar_Audio` recibía directamente el item del Webhook (que trae `body.conversation.messages...`), por lo que `$json.body...` resolvía correctamente. Al insertar `PG_get_openai_key_audio` inmediatamente antes, el `$json` que llega a `Descargar_Audio` pasó a ser el output del Postgres (`{ openai_api_key: "sk-..." }`), que **no tiene** el campo `body`. La expresión resolvía a `undefined` → URL malformada → error.
+
+### Fix
+Cambiar la referencia de `$json` (nodo inmediato anterior) a referencia explícita por nombre:
+```
+={{ $('Webhook').item.json.body.conversation.messages[0].attachments[0].data_url }}
+```
+
+### Lección
+Recurrencia directa del Bug 24 en un contexto nuevo. Refuerza la regla: cuando se inserta un nodo intermedio en un flujo existente, **todas las expresiones `$json` de los nodos aguas abajo se rompen silenciosamente** si el nodo insertado no propaga los mismos campos. La forma segura de referenciar datos que vienen de un nodo específico es siempre `$('NombreNodo').item.json.campo`, nunca `$json`. Como criterio operativo: antes de insertar un nodo en medio de una cadena, buscar todas las referencias `$json` en los nodos posteriores y convertirlas a referencias explícitas por nombre.
+
+---
+
+## Bug 31 — Signo `=` inicial en JSON body falla al pegar bloque completo con expresiones
+
+**Workflow:** `Flujo principal agencIA`
+**Nodo:** `Enviar_nota_privada_Chatwoot`
+
+### Síntoma
+Al pegar en el campo **JSON Body** del nodo HTTP Request un bloque JSON generado externamente que empezaba con `=` (para forzar modo Expression) y contenía expresiones `{{ }}` en su interior, n8n fallaba con:
+```
+The value in the "JSON Body" field is not valid JSON
+Expected ',' or '}' after property value in JSON at position 67 (line 2 column 66)
+```
+
+### Causa raíz
+Cuando el JSON body se **escribe/edita directamente en el campo** del nodo (no viene de otro nodo previo), n8n interpreta automáticamente las expresiones `{{ }}` que hay adentro del string — **sin** requerir un `=` al inicio. El `=` es la marca que n8n usa para valores que llegan de un contexto donde por defecto el modo es "Fixed" (por ejemplo, JSON pegado con `Ctrl+V` desde otro workflow). Al dejar el `=` al inicio manualmente, el parser JSON interno lo lee como un carácter literal antes del `{` de apertura, lo que rompe la validación sintáctica: `=` no es JSON válido.
+
+Adicionalmente, dentro del contenido de `content` se estaba usando concatenación JavaScript con `+` (`"texto" + $('nodo').item.json.campo + "texto"`) en vez de expresiones inline `{{ }}`, lo que agrava el problema — el parser JSON ve el `+` como carácter inválido después de un string.
+
+### Fix
+Dos cambios en el JSON body del nodo:
+1. **Quitar el `=` inicial.** El bloque debe empezar directamente por `{`.
+2. **Reemplazar concatenación con `+` por expresiones inline `{{ }}`** dentro de los strings. En vez de `"content": "texto " + $('X').item.json.campo + " más texto"`, escribir `"content": "texto {{ $('X').item.json.campo }} más texto"`.
+
+### Cómo se destapó
+Prueba directa: al quitar el `=` inicial del JSON body pegado, el error desapareció y la nota privada llegó correctamente a Chatwoot.
+
+### Lección
+El signo `=` al inicio de un campo en n8n no es una decoración obligatoria de modo Expression — depende de cómo se está introduciendo el valor. Cuando el usuario escribe/pega directamente en un campo tipo JSON body, n8n ya interpreta las `{{ }}` internas sin necesidad de `=`. Regla práctica: para JSON body escrito manualmente en un nodo HTTP Request con expresiones `{{ }}` adentro, **no** poner `=` al inicio; usar solo expresiones inline dentro de los valores, nunca concatenación JavaScript con `+`.
+
+---
+
+## Bug 32 — Webhook duplicado en Chatwoot causa respuesta doble del bot
+
+**Workflow:** `Flujo principal agencIA`
+**Origen:** Configuración de webhooks en Chatwoot
+
+### Síntoma
+Tras restaurar la API key de un tenant que había estado en incidente, el bot respondía correctamente al primer mensaje entrante — pero enviaba **la misma respuesta dos veces** al mismo turno del usuario. Comportamiento reproducible en cada mensaje nuevo.
+
+### Causa raíz
+La URL del webhook del workflow estaba registrada **dos veces** en la configuración de la cuenta de Chatwoot afectada: una vez en **Ajustes → Integraciones → Webhooks** y otra vez a través de una aplicación instalada en **Ajustes → Aplicaciones**. Cada mensaje entrante disparaba dos ejecuciones independientes del mismo workflow en n8n, cada una respondiendo por su cuenta.
+
+### Cómo se destapó
+Diagnóstico por eliminación siguiendo cuatro hipótesis (webhook duplicado, race condition en rama de media, memoria con contexto duplicado, mensajes viejos sin responder). La verificación de la primera hipótesis fue directa: contar cuántas ejecuciones aparecían en n8n → **Executions** para un único mensaje enviado. Al ver **dos ejecuciones** por cada mensaje, quedó confirmado que la duplicación venía del disparo, no del procesamiento interno.
+
+### Fix
+En Chatwoot de la cuenta afectada, revisar **ambas** ubicaciones de webhooks y eliminar la entrada duplicada, dejando solo una registración de la URL del workflow.
+
+### Lección
+Chatwoot permite registrar la misma URL de webhook en **dos lugares distintos** de la configuración de una misma cuenta (Ajustes → Integraciones → Webhooks y Ajustes → Aplicaciones), y ambos disparan de forma independiente. Al dar de alta un tenant nuevo o al debuggear duplicaciones de respuesta, revisar siempre las dos ubicaciones. Regla diagnóstica confiable: si un bot responde varias veces al mismo mensaje, lo primero es contar las ejecuciones en n8n para ese mensaje — si son más de una, el problema está en el disparo (webhook), no en el flujo.
+
+---
+
+## Bug 33 — Anti-flood aplicado a canales de bajo costo elimina trazabilidad por conversación
+
+**Workflow:** `Flujo principal agencIA`
+**Nodos:** `If_no_flood`, `Enviar_nota_privada_Chatwoot`, `Marcar_conversacion_urgente`, `Enviar_email_admin`, `Enviar_email_cliente`
+
+### Síntoma
+Durante las pruebas del sistema de notificaciones, al mandar un segundo mensaje al mismo tenant sin API key dentro de la ventana de 30 minutos, **no llegaba nada** — ni correos (esperado), ni nota privada en Chatwoot, ni marcado urgente (no esperado). El equipo humano que atendía la segunda conversación no tenía forma de saber por qué el bot había quedado mudo, salvo revisando conversaciones anteriores del mismo tenant.
+
+### Causa raíz
+El anti-flood se implementó en un solo punto (`If_no_flood`) que gobernaba **los cuatro canales de notificación en paralelo**: nota privada, marcado urgente, correo admin y correo cliente. La intención del anti-flood era proteger los correos (para no saturar bandejas de entrada), pero el nodo se colocó "antes" de los cuatro, cortando todo por igual dentro de la ventana. El resultado: cada conversación individual afectada perdía su nota privada y su marcado urgente, información **operativa por-conversación** que no tiene costo y sí es crítica para la atención humana.
+
+### Cómo se destapó
+Observación del propio operador durante las pruebas: "no envía la nota a Chatwoot ya que eso nos permite acercar la falla" — reconociendo que la nota privada es indicador operativo por conversación, no una notificación agregada.
+
+### Fix
+Separar los canales de notificación en dos grupos según su naturaleza:
+- **Canales por-conversación (SIEMPRE, sin anti-flood):** nota privada de Chatwoot y marcado urgente. Sin costo externo, información contextual por conversación individual, imprescindible para el agente humano que atiende.
+- **Canales agregados (CON anti-flood 30 min):** correo al admin y correo al cliente. Notificaciones externas que sí pueden saturar bandejas si se disparan por cada mensaje del mismo tenant.
+
+Estructura resultante:
+```
+If_openai_key_valid (FALSE)
+   ├─→ Enviar_nota_privada_Chatwoot       (SIEMPRE, por conversación)
+   ├─→ Marcar_conversacion_urgente         (SIEMPRE, por conversación)
+   └─→ PG_check_flood_30min → If_no_flood
+                                 ├─(sin flood)→ Enviar_email_admin → PG_log_incidente
+                                 │              Enviar_email_cliente
+                                 └─(con flood)→ ⛔ (correos cortados)
+```
+
+### Lección
+En sistemas de notificación multi-canal, el anti-flood **no debe aplicarse de forma uniforme** — depende del costo y la naturaleza de cada canal. Los canales de bajo costo con información por-conversación (notas internas, etiquetas, marcados de prioridad) deben ejecutarse siempre para preservar trazabilidad operativa; los canales agregados de alto costo (correos, SMS, llamadas) son los que requieren anti-flood. Diseñar cada rama con esta distinción evita perder señales operativas críticas por querer prevenir spam en canales externos.
+
+---
+
+## Bug 34 — `PATCH /conversations/{id}` de Chatwoot ignora `custom_attributes` silenciosamente
+
+**Workflow:** `Flujo principal agencIA`
+**Nodo:** `Marcar_conversacion_urgente`
+
+### Síntoma
+El nodo `Marcar_conversacion_urgente` (HTTP Request tipo PATCH a `/api/v1/accounts/{id}/conversations/{id}`) enviaba en el body:
+```json
+{
+  "priority": "urgent",
+  "custom_attributes": {
+    "desactivar_bot": true,
+    "sin_api_key": true
+  }
+}
+```
+La API respondía **200 OK** sin errores. `priority: urgent` se aplicaba correctamente y era visible en el panel de Chatwoot. Pero `custom_attributes` **nunca se reflejaba** — ni `desactivar_bot` ni `sin_api_key` cambiaban de valor en la conversación.
+
+### Causa raíz
+El endpoint `PATCH /conversations/{id}` de Chatwoot **solo acepta campos propios de la conversación** (`priority`, `status`, `assignee_id`, `team_id`, etc.). Los `custom_attributes` no forman parte de este endpoint, por lo que se ignoran silenciosamente sin generar error. Chatwoot tiene un endpoint dedicado y distinto para custom_attributes: `POST /conversations/{id}/custom_attributes` (el mismo que ya se usa en otros nodos del workflow como `actualizar_estado_lead`, `Chatwoot_inicializar_en_seguimiento`, etc.).
+
+### Cómo se destapó
+Verificación directa en el panel de Chatwoot tras una prueba: `priority` cambió a "urgente" pero `desactivar_bot` seguía en `false`. Consulta a la documentación de Chatwoot API 4.14 confirmó que `PATCH /conversations/{id}` no incluye `custom_attributes` en su especificación.
+
+### Fix
+Se descartó forzar `desactivar_bot: true` en este contexto por decisión de producto (ver nota abajo). El nodo `Marcar_conversacion_urgente` quedó simplificado a:
+```json
+{
+  "priority": "urgent"
+}
+```
+Sin ningún `custom_attributes` ni intento de mezclar endpoints.
+
+### Nota de producto (decisión de diseño)
+En el diagnóstico inicial se planteó agregar un nodo HTTP adicional que llamara al endpoint correcto (`POST /custom_attributes`) para efectivamente desactivar el bot mientras la key no estuviera disponible. La decisión del operador fue **no desactivar el bot** durante el incidente: al restaurarse la API key del tenant, el bot debe reanudar operación automáticamente en el siguiente mensaje entrante, sin intervención manual para reactivarlo. Solo se notifica (nota + urgente + correos) y se deja que la lógica normal del flujo (`Revisa si tiene etiqueta`, que evalúa `desactivar_bot`) determine qué hacer en el próximo turno.
+
+### Lección
+La API de Chatwoot separa `custom_attributes` en un endpoint dedicado (`POST /conversations/{id}/custom_attributes`) — no se pueden mezclar con los campos nativos del `PATCH /conversations/{id}`. Al armar un nodo que actualice ambas cosas, deben ser **dos llamadas HTTP separadas**, o usar solo el endpoint que corresponda a lo que se está actualizando. Regla diagnóstica: si un `PATCH` responde 200 pero un campo no se aplica, revisar si ese campo pertenece realmente al endpoint que se está usando o si necesita su propia ruta. El hecho de que Chatwoot no responda con error para campos no reconocidos es un comportamiento común de APIs REST y no debe interpretarse como confirmación de que el campo se aplicó.
