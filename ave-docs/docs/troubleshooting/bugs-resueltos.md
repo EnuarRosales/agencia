@@ -1035,3 +1035,261 @@ En el diagnóstico inicial se planteó agregar un nodo HTTP adicional que llamar
 
 ### Lección
 La API de Chatwoot separa `custom_attributes` en un endpoint dedicado (`POST /conversations/{id}/custom_attributes`) — no se pueden mezclar con los campos nativos del `PATCH /conversations/{id}`. Al armar un nodo que actualice ambas cosas, deben ser **dos llamadas HTTP separadas**, o usar solo el endpoint que corresponda a lo que se está actualizando. Regla diagnóstica: si un `PATCH` responde 200 pero un campo no se aplica, revisar si ese campo pertenece realmente al endpoint que se está usando o si necesita su propia ruta. El hecho de que Chatwoot no responda con error para campos no reconocidos es un comportamiento común de APIs REST y no debe interpretarse como confirmación de que el campo se aplicó.
+
+# Bugs resueltos — Auto-update completo y refinamientos multi-tenant OpenAI (sesión 03-04 jul 2026, parte 3)
+
+> Cubre los bugs 35 a 39. Workflow: `Flujo principal agencIA`. También toca el panel Appsmith y la migración de `bot_config`.
+> Contexto: continuación de la sesión de multi-tenant OpenAI. En esta parte se implementó el auto-update automático de `openai_key_status` desde el flujo n8n cuando OpenAI responde 401/quota, se agregó el reset automático del status cuando el admin guarda una nueva key desde Appsmith, y se cerró el ciclo con un badge visual en el panel Config Bot. Durante la validación end-to-end aparecieron cinco bugs encadenados que se documentan aquí — todos relacionados con manejo de estado entre múltiples fuentes (BD, snapshots de n8n, inputs de Appsmith) y con particularidades del motor de expresiones de n8n 2.23.3.
+
+---
+
+## Bug 35 — Referencias `$('X').item.json` traen el snapshot del momento en que X ejecutó, no el estado actual de BD
+
+**Workflow:** `Flujo principal agencIA`
+**Nodos:** `Enviar_email_admin`, `PG_log_incidente` (y en general cualquier nodo posterior al auto-update)
+
+### Síntoma
+Tras aplicar el auto-update de `openai_key_status` (`Code_analizar_error_openai` → `PG_update_openai_key_status`), la BD sí quedaba actualizada correctamente (`openai_key_status = 'invalid'`), pero:
+- El correo al administrador seguía mostrando `Estado: active` en el cuerpo HTML.
+- La tabla `openai_key_incidents` registraba `tipo_incidente = 'active'` en el campo del incidente detectado.
+
+Ambos datos contradecían el valor real que ya estaba en `bot_config` en ese mismo instante.
+
+### Causa raíz
+Los nodos posteriores (`Enviar_email_admin`, `PG_log_incidente`) leían el estado con `$('PG_get_empresa').item.json.openai_key_status`. En n8n, la referencia `$('NombreDeNodo').item.json` **no vuelve a consultar la fuente de datos** — devuelve el output que el nodo referenciado guardó **en el momento de su ejecución**, congelado en el contexto de esa corrida del workflow.
+
+`PG_get_empresa` había corrido al inicio del turno, cuando el status aún era `'active'` (todavía nadie había detectado el 401). Aunque `PG_update_openai_key_status` cambió la BD a `'invalid'` unos nodos después, la referencia al output original de `PG_get_empresa` seguía devolviendo `'active'` — porque estaba leyendo el snapshot, no re-consultando la tabla.
+
+Este comportamiento no es un bug de n8n, es el diseño del contexto de ejecución: cada nodo produce su output una sola vez y ese output es lo que quedan viendo los que lo referencien por nombre.
+
+### Fix
+Usar como fuente al nodo **más reciente que sí tiene el dato correcto** en el turno, con fallback en cadena para cubrir los caminos alternativos del flujo:
+
+```
+{{ $('Code_analizar_error_openai').item?.json?.nuevo_status
+   || $('PG_get_empresa').item.json.openai_key_status
+   || 'desconocido' }}
+```
+
+Con optional chaining (`?.`) para que la expresión no lance error cuando el nodo del auto-update no ejecutó (rama alternativa del flujo). El primer valor no nulo gana.
+
+Aplicado en:
+- `Enviar_email_admin` → campo HTML, línea del "Estado".
+- `PG_log_incidente` → query INSERT, campo `tipo_incidente`.
+
+### Cómo se destapó
+Prueba end-to-end del auto-update: al mandar un mensaje a un tenant con key inválida, la BD quedó correcta (`invalid`) pero el correo al admin llegó reportando `Estado: active`. Verificación cruzada entre lo que decía el correo, lo que decía la tabla `openai_key_incidents` y lo que efectivamente había quedado en `bot_config` reveló la inconsistencia.
+
+### Lección crítica
+En n8n, las referencias `$('NombreDeNodo').item.json` son **snapshots inmutables** del output de ese nodo en el momento en que ejecutó — no son consultas en vivo a la fuente de datos original. Si un valor puede modificarse dentro del mismo turno del workflow (por ejemplo, una columna de BD que se actualiza en un nodo intermedio), los nodos posteriores que necesiten el valor real deben referenciar el nodo **más reciente que lo produjo o modificó**, no el nodo original que lo leyó al inicio. Cuando existen ramas alternativas donde el nodo más reciente puede no haber ejecutado, usar optional chaining con fallback en cadena (`?.` + `||`) para que la expresión resuelva al valor correcto en cada camino sin lanzar errores — con la salvedad importante del Bug 38 sobre versiones recientes de n8n. Regla operativa: la referencia por nombre en n8n es una fotografía del pasado, no una ventana al presente.
+
+---
+
+## Bug 36 — Fingerprint de la key queda desincronizado con la key real por UPDATE parcial de columna dependiente
+
+**Workflow:** `Flujo principal agencIA`
+**Tabla:** `bot_config` (columnas `openai_api_key`, `openai_key_fingerprint`)
+**Nodos afectados:** `Enviar_email_admin`, `PG_log_incidente`
+
+### Síntoma
+Después de que un cliente rotara su API key, el correo al administrador seguía mostrando el fingerprint de la key **anterior** (por ejemplo `XB4A`), no el de la key nueva que efectivamente estaba cargada en BD y que efectivamente había fallado (por ejemplo `9999`). La incoherencia se propagaba también al log de incidentes.
+
+### Causa raíz
+`openai_key_fingerprint` es una **columna derivada**: se calcula como los últimos 4 caracteres de `openai_api_key`. Cuando el cliente actualiza su key (desde Appsmith o directamente en BD), la operación solo actualiza `openai_api_key` — no recalcula el fingerprint. Las dos columnas quedan desincronizadas hasta que alguna otra operación las alinee.
+
+Los canales de notificación (correo admin, log de incidentes) leían la columna `openai_key_fingerprint` confiando en que reflejaba la key actual, cuando en realidad podía tener el valor de una key rotada hace tiempo.
+
+### Fix
+En vez de leer la columna derivada, **calcular el fingerprint en runtime** desde la fuente primaria (`openai_api_key`), que sí se mantiene actualizada:
+
+En expresiones de n8n:
+```
+{{ $('PG_get_empresa').item.json.openai_api_key
+   ? $('PG_get_empresa').item.json.openai_api_key.slice(-4)
+   : 'N/A' }}
+```
+
+En SQL:
+```sql
+RIGHT(openai_api_key, 4)
+```
+
+Aplicado en `Enviar_email_admin` (HTML) y `PG_log_incidente` (INSERT).
+
+Como refuerzo estructural, el nodo `PG_update_openai_key_status` del auto-update también recalcula `openai_key_fingerprint = RIGHT(openai_api_key, 4)` cada vez que corre, así ambas columnas quedan sincronizadas al momento en que el sistema detecta un incidente. Adicionalmente la query `update_pipeline` de Appsmith aplica la misma lógica al guardar desde el panel admin.
+
+### Lección crítica
+Las columnas derivadas (que se calculan a partir de otras) son un vector típico de desincronización cuando la columna fuente se actualiza sin recalcular la derivada. Dos estrategias válidas para evitar el problema: (1) recalcular la derivada en runtime cada vez que se consulte, tratándola como cache y no como fuente de verdad; (2) siempre actualizar ambas columnas juntas en cualquier operación que toque la fuente. La solución más robusta es la primera — calcular en runtime — porque no depende de que todas las operaciones futuras de mantenimiento se acuerden de actualizar la derivada. En el modelo AVE, `openai_key_fingerprint` en `bot_config` es un cache de conveniencia para queries de admin; la fuente de verdad para reportes y logs es siempre `RIGHT(openai_api_key, 4)`.
+
+---
+
+## Bug 37 — Input password de Appsmith persiste strings mal formados sin validación estructural
+
+**Panel:** `Config Bot` en Appsmith
+**Widget:** `inp_openai_api_key`
+**Query:** `update_pipeline` (UPSERT sobre `bot_config`)
+
+### Síntoma
+Después de "actualizar" la API key desde el panel Appsmith, la key quedaba guardada en BD con caracteres perdidos o valores incompletos. En un caso concreto, la key en BD quedó como `k-proj-6b1GjjNN...` (163 caracteres, sin el `s` inicial) en lugar de la key completa `sk-proj-...` (164 caracteres). El sistema n8n detectaba correctamente el fallo estructural, pero el problema originario estaba en el ingreso: el input aceptó y guardó una key inválida por formato como si fuera legítima.
+
+### Causa raíz
+El input de tipo password en Appsmith tiene dos comportamientos problemáticos que combinados producen inconsistencia:
+- Al cargar el panel para editar una empresa existente, el input **no siempre precarga la key completa** — a veces viene vacío por seguridad, a veces con un fragmento del valor guardado.
+- Al copiar/pegar una key nueva desde el gestor de contraseñas o desde el clipboard, algunos caracteres del inicio pueden perderse dependiendo de cómo se seleccionó el texto o si hay caracteres invisibles al inicio.
+
+La query `update_pipeline` en su versión inicial guardaba el contenido del input tal como llegaba, sin ninguna validación estructural mínima (formato `sk-`, longitud mínima). Cualquier string que estuviera en el input al momento del submit se persistía en `bot_config.openai_api_key`.
+
+### Cómo se destapó
+Test en cascada: tras varias pruebas del sistema de detección, el badge del panel decía `Key Activa` pero los mensajes de WhatsApp seguían generando incidentes. Query directa a BD reveló que `LEFT(openai_api_key, 3) = 'k-p'` con `LENGTH = 163`, cuando debería ser `sk-p` con 164. La key había sido "actualizada" desde el panel, pero el input había perdido el `s` inicial en el proceso.
+
+### Fix (parcial aplicado, refuerzo pendiente)
+Se aplicaron dos correcciones inmediatas:
+1. UPDATE directo en BD para restaurar el `s` faltante:
+   ```sql
+   UPDATE bot_config
+   SET openai_api_key = 's' || openai_api_key,
+       openai_key_status = 'active',
+       openai_key_fingerprint = RIGHT('s' || openai_api_key, 4),
+       updated_at = NOW()
+   WHERE empresa_id = 1
+     AND openai_api_key LIKE 'k-%'
+     AND openai_api_key NOT LIKE 'sk-%';
+   ```
+2. Refuerzo pendiente para el próximo ciclo: envolver los tres campos relacionados a la key en la query `update_pipeline` con un `CASE WHEN` que solo actualice si el nuevo valor cumple estructura mínima (`LIKE 'sk-%' AND LENGTH >= 40`); si no cumple, conservar el valor anterior de esas columnas sin frenar el guardado del resto del formulario.
+
+Como red de seguridad complementaria, el flujo n8n ya detecta y reporta keys estructuralmente inválidas (Bug 39) — el input mal validado no rompe el sistema, solo genera un incidente que llega por correo y nota privada.
+
+### Lección crítica
+En interfaces admin donde el usuario edita datos sensibles con formato específico (API keys, tokens, IDs), la validación estructural mínima **debe ejecutarse en la capa del formulario**, no delegarse enteramente al backend. Los inputs de tipo password son especialmente propensos a errores de copia/pega porque no muestran el contenido para verificación visual — el usuario cree que copió correctamente pero puede haber perdido caracteres. Regla operativa: cualquier campo sensible con formato conocido debe validar en el submit (prefijo, longitud mínima, expresión regular básica) antes de disparar el UPSERT, o el UPSERT mismo debe rechazar/preservar según regla estructural (`CASE WHEN` en SQL). La detección aguas abajo (flujo n8n) es red de seguridad, no reemplazo de la validación en el punto de ingreso.
+
+---
+
+## Bug 38 — n8n 2.23.3 rechaza referencias a nodos no ejecutados con error explícito, rompiendo expresiones con optional chaining
+
+**Workflow:** `Flujo principal agencIA`
+**Nodos afectados:** `Enviar_email_admin`, `PG_log_incidente`
+**Versión afectada:** n8n 2.23.3 self-hosted (comportamiento nuevo respecto a versiones anteriores)
+
+### Síntoma
+Después de haber aplicado el fix del Bug 35 (expresiones con `$('Code_analizar_error_openai').item?.json?.nuevo_status || fallback`), al enviar un mensaje que caía en la rama FALSE del `If_openai_key_valid` (donde `Code_analizar_error_openai` no ejecuta), el nodo `Enviar_email_admin` fallaba con error explícito:
+
+```
+An expression references this node, but the node is unexecuted.
+Consider re-wiring your nodes or checking for execution first,
+i.e. {{ $if( $("{{nodeName}}").isExecuted, <action_if_executed>, "") }}
+Node 'Code_analizar_error_openai' hasn't been executed.
+```
+
+El correo no llegaba, la nota privada no llegaba (porque el nodo email cortaba el flujo con error), y el log de incidentes no se registraba.
+
+### Causa raíz
+En versiones anteriores de n8n, referenciar un nodo que no ejecutó con `$('X').item?.json?.campo` devolvía `undefined` silenciosamente y el operador `||` funcionaba como fallback. En n8n 2.23.3, el motor de expresiones **detecta activamente** cuando una expresión referencia un nodo que no formó parte de la corrida y lanza `NodeApiError: Node 'X' hasn't been executed`, incluso si la referencia usa optional chaining.
+
+El error mismo mensaje sugiere directamente el patrón correcto (`$if($("X").isExecuted, ..., "")`), lo que confirma que es un cambio deliberado del comportamiento — no un bug de la plataforma sino una decisión de fallar rápido en vez de resolver a `undefined` silencioso.
+
+### Cómo se destapó
+Escenario específico: envío de mensaje con key mal formada (`k-pro...`, sin `sk-`). El `If_openai_key_valid` cayó en FALSE, disparando la rama de notificaciones sin pasar por `Code_analizar_error_openai`. El nodo `Enviar_email_admin` levantó el error, cortando el envío. La captura del error trajo textualmente el patrón sugerido, lo que aceleró el diagnóstico.
+
+### Fix
+Reemplazar el patrón con optional chaining por el patrón oficial con `isExecuted`:
+
+Antes (rompe en 2.23.3):
+```
+{{ $('Code_analizar_error_openai').item?.json?.nuevo_status
+   || $('PG_get_empresa').item.json.openai_key_status
+   || 'desconocido' }}
+```
+
+Después (funciona en 2.23.3):
+```
+{{ $('Code_analizar_error_openai').isExecuted
+   ? $('Code_analizar_error_openai').item.json.nuevo_status
+   : ($('PG_get_empresa').item.json.openai_key_status || 'desconocido') }}
+```
+
+Aplicado en:
+- `Enviar_email_admin` → campo HTML, línea del "Estado".
+- `PG_log_incidente` → query INSERT, campo `tipo_incidente`.
+
+Refinamiento adicional: para casos donde ni `Code_analizar_error_openai` ni `PG_get_empresa` tienen el dato correcto (rama FALSE del IF donde el status en BD aún dice `active` pero la key es estructuralmente inválida), se anidó una lógica de predicción que replica la validación del IF en la propia expresión:
+
+```
+{{ $('Code_analizar_error_openai').isExecuted
+   ? $('Code_analizar_error_openai').item.json.nuevo_status
+   : (!$('PG_get_empresa').item.json.openai_api_key
+        || $('PG_get_empresa').item.json.openai_api_key.length === 0
+        ? 'no_config'
+        : (!$('PG_get_empresa').item.json.openai_api_key.startsWith('sk-')
+              || $('PG_get_empresa').item.json.openai_api_key.length < 40
+              ? 'invalid'
+              : ($('PG_get_empresa').item.json.openai_key_status || 'desconocido'))) }}
+```
+
+Esa cascada devuelve el estado "predicho" del incidente antes de que el nodo Postgres lo actualice en BD, dando coherencia entre lo que dice el correo y lo que quedará en la tabla.
+
+### Lección crítica
+n8n 2.23.3 cambió el comportamiento del motor de expresiones para fallar explícitamente cuando se referencian nodos no ejecutados, incluso con optional chaining. El patrón compatible es `$('X').isExecuted ? $('X').item.json.campo : fallback` (ternario con verificación previa), no el `$('X').item?.json?.campo || fallback` que funcionaba antes. Regla operativa para workflows donde un mismo nodo destino puede recibir input de rutas alternativas (agente que puede o no fallar, IF que puede o no rechazar): revisar todas las expresiones que referencian nodos posiblemente no ejecutados y migrarlas a `isExecuted`. El error mismo sugiere textualmente el patrón, así que ante mensajes de "Node hasn't been executed" la solución está en la propia captura.
+
+---
+
+## Bug 39 — El IF de validación previa rechaza keys mal formadas pero no actualiza el status en BD
+
+**Workflow:** `Flujo principal agencIA`
+**Nodos:** `If_openai_key_valid`, `PG_update_status_desde_IF` (nuevo)
+
+### Síntoma
+Al enviar varios mensajes de WhatsApp a un tenant con key estructuralmente inválida en BD (por ejemplo `k-pro...` sin `sk-`), el sistema disparaba correctamente las notificaciones (nota privada en Chatwoot, marcado urgente, correo al admin), pero el campo `openai_key_status` en `bot_config` **permanecía en `active`** turno tras turno, aunque el flujo estaba claramente rechazando la key.
+
+El badge del panel Appsmith seguía en Key Activa, y las queries de auditoría también mostraban estado sano — inconsistente con la realidad de que el bot no podía operar.
+
+### Causa raíz
+El auto-update del status (nodo `PG_update_openai_key_status`) solo estaba conectado en el camino que pasa por el `AI_Agent_Principal` — es decir, se ejecuta únicamente cuando el agente **realmente intenta** llamar a OpenAI y falla con 401/quota. Ese camino cubre keys que estructuralmente parecen válidas pero son rechazadas por OpenAI en runtime.
+
+La rama FALSE del `If_openai_key_valid` (que rechaza keys por estructura antes de llegar al agente: NULL, no `sk-*`, longitud insuficiente) disparaba las notificaciones pero **no tenía ningún nodo que actualizara BD**. El flujo notificaba y seguía adelante sin dejar rastro del incidente en el estado del tenant.
+
+Esto era un gap estructural del diseño original: el auto-update cubría un único camino en vez de todos los caminos que llevan a rechazar la key.
+
+### Cómo se destapó
+Sesión de pruebas del ciclo end-to-end: se dejó a propósito la key con formato inválido (`k-pro`, sin `s` inicial) y se enviaron varios mensajes seguidos. Los correos llegaron correctamente pero la consulta en DBeaver:
+```sql
+SELECT openai_key_status FROM bot_config WHERE empresa_id = 1;
+```
+seguía devolviendo `active` después de cada envío. El operador reportó el comportamiento con la frase "y enviando varios mensajes al whatsapp" acompañada del resultado de la consulta, lo que reveló el gap.
+
+### Fix
+Nuevo nodo Postgres `PG_update_status_desde_IF` conectado como cuarta salida de la rama FALSE del `If_openai_key_valid`. El nodo aplica la misma lógica de clasificación estructural del IF sobre BD:
+
+```sql
+UPDATE bot_config
+SET openai_key_status = CASE
+      WHEN openai_api_key IS NULL
+           OR LENGTH(openai_api_key) = 0
+        THEN 'no_config'
+      WHEN openai_api_key NOT LIKE 'sk-%'
+        THEN 'invalid'
+      WHEN LENGTH(openai_api_key) < 40
+        THEN 'invalid'
+      ELSE openai_key_status
+    END,
+    openai_key_fingerprint = CASE
+      WHEN openai_api_key IS NULL OR LENGTH(openai_api_key) = 0
+        THEN NULL
+      ELSE RIGHT(openai_api_key, 4)
+    END,
+    updated_at = NOW()
+WHERE empresa_id = {{ $('PG_get_empresa').item.json.id }};
+```
+
+Estructura final de la rama FALSE:
+```
+If_openai_key_valid (FALSE)
+   ├─→ Enviar_nota_privada_Chatwoot
+   ├─→ Marcar_conversacion_urgente
+   ├─→ PG_check_flood_30min → correos
+   └─→ PG_update_status_desde_IF    (nuevo)
+```
+
+Con esto, ambos caminos de rechazo de key (estructural via IF, y runtime via agente + `Code_analizar_error_openai`) actualizan `openai_key_status` en BD, y el badge del panel Appsmith refleja el estado real después de cada incidente.
+
+### Lección crítica
+Cuando un sistema tiene múltiples caminos para detectar el mismo tipo de problema (validación estructural previa vs. validación runtime), **todos los caminos deben producir los mismos efectos secundarios** — no solo notificar, sino también actualizar el estado que la aplicación considera "fuente de verdad". Un sistema donde algunos caminos actualizan el estado y otros solo notifican termina con inconsistencias silenciosas entre lo que dicen los canales de alerta y lo que dice la BD. Regla operativa para diseños multi-camino: mapear los efectos secundarios esperados (log, actualización de estado, notificación) y verificar en cada camino que los tres se disparen, no solo el que sea más visible. Es el mismo patrón del Bug 11 (agendado con múltiples caminos hacia el mismo nodo de efecto) pero al revés: en vez de que dos caminos disparen efectos duplicados, aquí solo uno disparaba el efecto crítico y el otro se quedaba corto.
