@@ -1293,3 +1293,121 @@ Con esto, ambos caminos de rechazo de key (estructural via IF, y runtime via age
 
 ### Lección crítica
 Cuando un sistema tiene múltiples caminos para detectar el mismo tipo de problema (validación estructural previa vs. validación runtime), **todos los caminos deben producir los mismos efectos secundarios** — no solo notificar, sino también actualizar el estado que la aplicación considera "fuente de verdad". Un sistema donde algunos caminos actualizan el estado y otros solo notifican termina con inconsistencias silenciosas entre lo que dicen los canales de alerta y lo que dice la BD. Regla operativa para diseños multi-camino: mapear los efectos secundarios esperados (log, actualización de estado, notificación) y verificar en cada camino que los tres se disparen, no solo el que sea más visible. Es el mismo patrón del Bug 11 (agendado con múltiples caminos hacia el mismo nodo de efecto) pero al revés: en vez de que dos caminos disparen efectos duplicados, aquí solo uno disparaba el efecto crítico y el otro se quedaba corto.
+
+# Bugs resueltos — Workflow de recordatorios blindado multi-tenant (sesión 04 jul 2026, parte 4)
+
+> Cubre los bugs 40 y 41. Workflow: `AVE - Recordatorios Automaticos`.
+> Contexto: al finalizar la sesión de multi-tenant OpenAI del flujo principal, se revisó el workflow de recordatorios automáticos para garantizar que también fuera robusto ante los mismos escenarios de fallo de API key por tenant. La revisión destapó dos bugs encadenados: uno estructural (el filtro inicial no descartaba tenants sin key) y uno de robustez runtime (el nodo de extracción no manejaba errores de OpenAI). Ambos causaban crashes silenciosos del workflow completo en producción, afectando también a tenants con key sana. Los fixes se validaron con prueba controlada en vivo antes de cerrar la sesión.
+
+---
+
+## Bug 40 — Un tenant sin API key hacía crashear el workflow completo de recordatorios cada 5 minutos
+
+**Workflow:** `AVE - Recordatorios Automaticos`
+**Nodo:** `PG_get_empresas`
+
+### Síntoma
+El panel Executions del workflow mostraba una secuencia continua de ejecuciones fallidas: alrededor de 12 crashes por hora, cada una durando ~300ms (muy corta, patrón típico de crash inmediato al arrancar). Los recordatorios de tienda4030, agencIA y PC_Outlet (con keys sanas) tampoco llegaban, aunque tenían leads elegibles esperando desde hacía horas. En cambio, agencIA aparecía funcionando "a medias" porque cuando el loop empezaba por ella (primera empresa en orden de ID), alcanzaba a procesar un par de conversaciones antes de que Uhane rompiera todo.
+
+### Causa raíz
+La query del nodo `PG_get_empresas` solo filtraba por `WHERE e.activo = true`, sin verificar el estado operativo de la API key de OpenAI. En la BD, la empresa 7 (Uhane SAS) tenía `openai_api_key = ''` (string vacío, no NULL) pero `openai_key_status = 'active'` — un estado "falso positivo" que ningún flujo había corregido antes porque este workflow no participaba del sistema de auto-update de estado del flujo principal.
+
+Cada 5 minutos, el Cron disparaba el workflow, la query traía las 4 empresas activas, el loop entraba a Uhane, llegaba al nodo `OpenAI_generar` que hacía HTTP POST a `https://api.openai.com/v1/chat/completions` con `Authorization: Bearer ` (vacío), OpenAI respondía 401 con mensaje "You didn't provide an API key", el nodo tenía `onError: continueRegularOutput` así que el error pasaba al siguiente nodo, y `Code_extract` intentaba leer `$input.item.json.choices[0].message.content.trim()` sobre un objeto que solo tenía la estructura `{error: {...}}` sin `choices`. El TypeError "Cannot read properties of undefined (reading '0')" no era capturado por nadie y crasheaba la ejecución entera del workflow. Los tenants siguientes en el loop no llegaban a procesarse.
+
+### Cómo se destapó
+Revisión del panel Executions durante la revisión general del workflow: la señal más evidente fue el patrón de duración. Ejecuciones fallidas duraban 269ms, 291ms, 309ms, 320ms — todas absurdamente cortas para un workflow que en una corrida sana debería tomar 8-12 segundos (procesamiento de varios tenants con varias conversaciones cada uno). La duración corta apuntaba a un crash inmediato al arrancar el loop, no a un fallo aislado dentro del procesamiento. Query de diagnóstico posterior identificó a Uhane con `openai_api_key = ''` y confirmó la hipótesis.
+
+### Fix
+Agregar cuatro filtros estructurales en la query de `PG_get_empresas` para que tenants sin key operativa no entren al loop:
+
+    SELECT ...
+    FROM empresas e
+    JOIN bot_config bc ON bc.empresa_id = e.id
+    JOIN recordatorio_config rc ON rc.empresa_id = e.id AND rc.activo = true
+    WHERE e.activo = true
+      AND bc.openai_api_key IS NOT NULL
+      AND LENGTH(bc.openai_api_key) >= 40
+      AND bc.openai_api_key LIKE 'sk-%'
+      AND bc.openai_key_status = 'active'
+    GROUP BY ...
+
+Los cuatro filtros cubren los escenarios de fallo estructural que ya eran conocidos por el flujo principal (Bug 37, Bug 39): key `NULL`, key vacía, key sin prefijo `sk-`, y key marcada como no operativa (`invalid`, `no_saldo`, `revoked`, `no_config`).
+
+Después del fix se marcó Uhane como `openai_key_status = 'no_config'` para reflejar la realidad y evitar que el badge del panel Appsmith mintiera. En un momento posterior de la sesión el cliente reintrodujo su API key desde Appsmith, la query `update_pipeline` la reseteó a `active`, y Uhane volvió a entrar al loop de recordatorios con normalidad.
+
+### Lección crítica
+En un sistema SaaS multi-tenant, la primera query que agrupa tenants para un procesamiento en lote debe filtrar por **todas las precondiciones operativas** que el resto del flujo asume, no solo por la bandera genérica de `activo`. Un solo tenant defectuoso puede tumbar el batch completo si el filtro inicial no coincide con las precondiciones aguas abajo. En este caso, el flujo asumía que `openai_api_key` estaba poblada y era válida, pero el filtro inicial no lo verificaba. La regla operativa que se deriva: para cada workflow multi-tenant, mapear qué campos de cada tenant asume el flujo como precondiciones (llaves de API, credenciales, configuraciones) y agregar todos esos campos al `WHERE` de la query inicial. Es más eficiente y más seguro que descubrir los tenants inválidos en runtime, uno por uno, con crashes intermitentes que afectan a los sanos.
+
+---
+
+## Bug 41 — `Code_extract` sin guardián crasheaba el workflow ante cualquier error runtime de OpenAI
+
+**Workflow:** `AVE - Recordatorios Automaticos`
+**Nodos:** `Code_extract`, `If_mensaje_ok` (nuevo)
+
+### Síntoma
+Aunque el Bug 40 resolvió el escenario más común (tenant sin key), quedaba la puerta abierta para otros errores runtime de OpenAI que el filtro estructural no puede prever: key revocada entre dos llamadas, rate limit 429, timeout de red, servicio OpenAI caído (503), cuenta sin saldo (`insufficient_quota`). En cualquiera de estos escenarios, el workflow volvería a crashear con el mismo `TypeError` del Bug 40, porque el nodo `Code_extract` seguía asumiendo ciegamente que la respuesta de OpenAI tendría estructura `choices[0].message`.
+
+### Causa raíz
+El código original del nodo `Code_extract` era una sola línea de acceso directo:
+
+    const mensaje = $input.item.json.choices[0].message.content.trim();
+
+Cuando el nodo previo `OpenAI_generar` tenía `onError: continueRegularOutput` y fallaba, el item que llegaba a `Code_extract` no era la respuesta esperada de OpenAI sino un objeto con estructura `{error: {message, code, status, ...}}`. Al intentar leer `choices[0]` sobre ese objeto, JavaScript lanzaba `TypeError: Cannot read properties of undefined (reading '0')`, el error no era capturado por ningún try/catch, y el nodo entero crasheaba la ejecución del workflow.
+
+El detalle clave es que `continueRegularOutput` de n8n **no transforma el item de error en algo con estructura estándar** — pasa el objeto de error tal cual llegó del HTTP Request, con los campos que ese error trae. La única forma de que el nodo siguiente pueda distinguir un caso éxito de un caso error es verificando la existencia de campos que solo existen en el caso éxito (como `choices`), no confiando en la ausencia de campos de error (como `error`).
+
+### Cómo se destapó
+El mensaje de error del workflow lo dijo textualmente: "Cannot read properties of undefined (reading '0') [line 1]". La línea 1 del Code node era exactamente la lectura de `choices[0]`. No había ambigüedad sobre dónde estaba el bug. Lo que faltaba era el guardián para no llegar a esa línea cuando el input viniera con estructura de error.
+
+### Fix
+Refactor del código del `Code_extract` para verificar la estructura antes de acceder a campos anidados:
+
+    const input = $input.item.json;
+
+    if (!input.choices || !input.choices[0] || !input.choices[0].message) {
+      const errorMsg = input.error?.message || 'OpenAI no devolvio respuesta valida';
+      console.log('OpenAI_generar fallo para conversacion:',
+        $('Loop_conversaciones').item.json.conversacion_id, '-', errorMsg);
+      return {
+        json: {
+          skip_por_error_openai: true,
+          error_openai: errorMsg,
+          conversacion_id: $('Loop_conversaciones').item.json.conversacion_id
+        }
+      };
+    }
+
+    const mensaje = input.choices[0].message.content.trim();
+    const prev = $('Code_historial').item.json;
+    return { json: { ...prev, mensaje_generado: mensaje }};
+
+Adicionalmente se agregó un nuevo nodo `If_mensaje_ok` inmediatamente después de `Code_extract`, con condición `{{ $json.skip_por_error_openai }} is not equal to true` y `Convert types where required` activado. Rutea:
+- **Rama TRUE** (mensaje válido) → `Chatwoot_enviar` → `PG_marcar` → `Loop_conversaciones` (siguiente item).
+- **Rama FALSE** (skip por error) → directamente a `Loop_conversaciones` (siguiente item, sin enviar ni marcar).
+
+### Validación en vivo con prueba controlada
+El fix se validó en producción con una prueba deliberada:
+1. Se guardó la key real de agencIA en un lugar seguro.
+2. Se cambió temporalmente su `openai_api_key` en BD por `sk-proj-TEST9999...` (estructuralmente válida para pasar el filtro del Bug 40, pero inválida en OpenAI).
+3. Se forzó la conversación 1127 de agencIA a ser elegible (`ultimo_mensaje_usuario_at` retrocedido en el tiempo).
+4. Se esperó al próximo Cron (5 minutos).
+5. Verificación en el panel Executions: la ejecución terminó en **verde**, no en rojo.
+6. Verificación en el output del `Code_extract`:
+
+        {
+          "skip_por_error_openai": true,
+          "error_openai": "401 - Incorrect API key provided: sk-proj-***9999...",
+          "conversacion_id": 1127
+        }
+
+7. Verificación de que `Chatwoot_enviar` y `PG_marcar` no ejecutaron para esa conversación (rama FALSE del `If_mensaje_ok`).
+8. Verificación en BD: cero recordatorios nuevos para empresa_id=1, cero cambios en `recordatorios_enviados` de la conversación 1127.
+9. Restauración de la key real de agencIA y confirmación funcional enviando un mensaje al WhatsApp.
+
+Los 9 pasos se cumplieron exactamente como diseño esperaba. Blindaje operativo.
+
+### Lección crítica
+Cualquier nodo Code de n8n que consuma el output de un HTTP Request con `onError: continueRegularOutput` debe **verificar la estructura del input antes de acceder a campos anidados**. El `continueRegularOutput` no transforma el error en un item con estructura vacía o predecible — pasa el objeto de error tal cual llegó del servidor externo. La consecuencia práctica es que el patrón de "acceso directo optimista" (`$input.item.json.choices[0]...`) es una bomba de tiempo para producción: funcionará en el 99% de los casos y explotará silenciosamente el 1% restante cuando el servicio externo falle, con un TypeError no capturado que crashea todo el workflow. La regla operativa: para cualquier acceso a `choices`, `data`, `results`, `payload` o cualquier campo que dependa de una respuesta exitosa de un servicio externo, el primer statement del nodo Code debe ser un guardián que verifique la existencia del campo esperado y devuelva un item de skip explícito en caso contrario. Esto refuerza la lección del Bug 19 (Continue On Fail como red de seguridad) pero un nivel más adentro: no basta con que el nodo HTTP siga ejecutando ante error, hay que asegurar que los nodos posteriores sepan interpretar el item de error sin crashear.
+
+
