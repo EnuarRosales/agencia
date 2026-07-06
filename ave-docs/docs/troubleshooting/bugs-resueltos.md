@@ -1410,4 +1410,78 @@ Los 9 pasos se cumplieron exactamente como diseño esperaba. Blindaje operativo.
 ### Lección crítica
 Cualquier nodo Code de n8n que consuma el output de un HTTP Request con `onError: continueRegularOutput` debe **verificar la estructura del input antes de acceder a campos anidados**. El `continueRegularOutput` no transforma el error en un item con estructura vacía o predecible — pasa el objeto de error tal cual llegó del servidor externo. La consecuencia práctica es que el patrón de "acceso directo optimista" (`$input.item.json.choices[0]...`) es una bomba de tiempo para producción: funcionará en el 99% de los casos y explotará silenciosamente el 1% restante cuando el servicio externo falle, con un TypeError no capturado que crashea todo el workflow. La regla operativa: para cualquier acceso a `choices`, `data`, `results`, `payload` o cualquier campo que dependa de una respuesta exitosa de un servicio externo, el primer statement del nodo Code debe ser un guardián que verifique la existencia del campo esperado y devuelva un item de skip explícito en caso contrario. Esto refuerza la lección del Bug 19 (Continue On Fail como red de seguridad) pero un nivel más adentro: no basta con que el nodo HTTP siga ejecutando ante error, hay que asegurar que los nodos posteriores sepan interpretar el item de error sin crashear.
 
+# Bug resuelto — Auto-update de openai_key_status disparaba notificaciones en mensajes sanos (sesión 05 jul 2026)
+
+> Cubre el bug 42. Workflow: `Flujo principal agencIA`.
+> Contexto: durante pruebas de agencIA en producción se detectó que el bot respondía correctamente a los mensajes del usuario, pero cada respuesta iba acompañada de una nota privada "🤖 ⚠️ BOT DESACTIVADO AUTOMÁTICAMENTE" en Chatwoot y de un correo al admin. Ninguna de las 3 fuentes de auto-update habituales (agente, IF estructural, Appsmith) debía dispararse porque el estado en BD era correcto (`openai_key_status = 'active'`). El diagnóstico reveló un gap en las conexiones entre `Code_analizar_error_openai` y `PG_update_openai_key_status` que hacía que la cadena de notificaciones se disparara en todos los mensajes, con o sin error real.
+
+---
+
+## Bug 42 — Falta de filtro entre `Code_analizar_error_openai` y `PG_update_openai_key_status` disparaba notificaciones en cada mensaje sano
+
+**Workflow:** `Flujo principal agencIA`
+**Nodos afectados:** `Code_analizar_error_openai`, `PG_update_openai_key_status`, `If_hay_error_openai` (nuevo)
+
+### Síntoma
+En producción, cada mensaje entrante del usuario a agencIA generaba en Chatwoot:
+- Respuesta correcta del bot (comportamiento esperado).
+- Nota privada con el texto "🤖 ⚠️ BOT DESACTIVADO AUTOMÁTICAMENTE" y motivo "API key con problema" (comportamiento erróneo).
+- Correo al admin con el mismo motivo (comportamiento erróneo, filtrado parcialmente por anti-flood).
+- Fila nueva en `openai_key_incidents` con `tipo_incidente = 'null'` (comportamiento erróneo).
+
+El operador humano que atendiera la conversación vería las notas privadas y asumiría que el bot estaba caído, cuando en realidad estaba respondiendo correctamente.
+
+### Causa raíz
+El nodo `Code_analizar_error_openai` estaba conectado directamente al nodo `PG_update_openai_key_status` sin ningún filtro intermedio. El diseño asumía que el UPDATE se autolimitaría mediante su cláusula `AND '{{ $json.debe_actualizar_bd }}' = 'true'` cuando no hubiera error real, pero ese guardián solo evita el UPDATE mismo — **no evita que la propagación del item continúe hacia los nodos posteriores** en el canvas.
+
+Cuando el `AI_Agent_Principal` respondía bien:
+1. `Code_analizar_error_openai` recibía el item sin campo `error`.
+2. El código evaluaba `if (item.error)` como falso y devolvía `{ tiene_error: false, nuevo_status: null, debe_actualizar_bd: false }`.
+3. El nodo se marcaba como "ejecutado exitosamente" y n8n propagaba el item a `PG_update_openai_key_status`.
+4. El UPDATE efectivamente no ejecutaba en Postgres (`WHERE ... AND 'false' = 'true'` no matchea), pero el nodo Postgres se marcaba también como "ejecutado exitosamente" y propagaba a los siguientes.
+5. La cadena completa de notificaciones (`Enviar_nota_privada_Chatwoot`, `Marcar_conversacion_urgente`, `PG_check_flood_30min`, `PG_log_incidente`) se disparaba, disparando notas + correos + logs con datos vacíos.
+
+El `tipo_incidente = 'null'` en la tabla `openai_key_incidents` era el síntoma revelador: la expresión de coalescing del `PG_log_incidente` intentaba usar `$('Code_analizar_error_openai').item.json.nuevo_status`, que era literalmente `null` en este escenario, y al interpolarse en SQL quedaba como la cadena `'null'`.
+
+### Cómo se destapó
+Diagnóstico por descarte en producción. El operador reportó "el agente esta enviando la nota privada en cada mensaje funciona el agente pero se está enviando esa nota privada". Verificaciones sucesivas descartaron:
+- Webhook duplicado en Chatwoot (había 3 ejecuciones por mensaje, pero 2 eran fantasmas cortadas correctamente por `Outgoing/Incoming`).
+- Rama FALSE del `If_openai_key_valid` mal cableada (la rama TRUE fue la que se disparó en la ejecución con la nota).
+- Estado incorrecto de `openai_key_status` en BD (verificado como 'active').
+
+El hallazgo definitivo vino al abrir el nodo `PG_update_openai_key_status` en el editor y observar en el panel INPUT izquierdo que aparecía `Code_analizar_error_openai` como fuente directa, sin filtro intermedio. En la ejecución 1110 (que respondió bien) también se veía que los nodos de notificación aparecían en verde a pesar de no haber habido error real.
+
+### Fix
+Insertar un nodo `If_hay_error_openai` entre `Code_analizar_error_openai` y `PG_update_openai_key_status`. Configuración del IF:
+- **Condición:** `{{ $json.tiene_error }} is equal to true` (Boolean)
+- **Convert types where required:** ON
+- **Salida TRUE (arriba):** conectada a `PG_update_openai_key_status` → cadena de notificaciones.
+- **Salida FALSE (abajo):** sin conectar (el flujo se corta).
+
+Estructura final:
+
+    AI_Agent_Principal
+        ↓
+    Code_analizar_error_openai
+        ↓
+    If_hay_error_openai
+        ├─(TRUE)──→ PG_update_openai_key_status → Enviar_nota_privada_Chatwoot
+        │                                         Marcar_conversacion_urgente
+        │                                         PG_check_flood_30min → correos + log
+        │
+        └─(FALSE)──→ (sin conexión, corte del flujo)
+
+Solo cuando el `Code_analizar_error_openai` detecta un error real de OpenAI y devuelve `tiene_error: true`, el IF permite que la cadena de notificaciones se dispare. En cualquier otro caso el flujo se corta ahí.
+
+### Validación en vivo
+Tras aplicar el fix, se envió un mensaje al bot de agencIA y se verificó:
+1. **En Chatwoot:** el bot respondió correctamente, sin nota privada. ✅
+2. **En n8n Executions:** ejecución en verde. `Code_analizar_error_openai` en verde con `tiene_error: false`. `If_hay_error_openai` en verde con rama FALSE. `PG_update_openai_key_status` y todos los nodos de notificación en gris (no ejecutados). ✅
+3. **En BD:** no se agregó fila nueva en `openai_key_incidents`. ✅
+
+### Lección crítica
+En n8n, un nodo Code que "ejecuta exitosamente" (sin lanzar excepción) siempre propaga su output a los nodos posteriores, incluso si el output es semánticamente vacío o negativo (`tiene_error: false`, arrays vacíos con `[]`, objetos con campos `null`). Los guardianes lógicos dentro de queries SQL o dentro de código JavaScript **evitan que la operación crítica se ejecute** (por ejemplo el `WHERE ... AND 'false' = 'true'` evita el UPDATE), pero **no evitan que el flujo continúe hacia adelante en el canvas**. Para cortar realmente una rama del flujo cuando una condición no se cumple, hay que usar un nodo IF explícito con la salida FALSE sin conectar. La regla operativa: cuando una decisión determina si toda una cadena de acciones debe ejecutarse o no, esa decisión debe estar visible en el canvas como un IF, no oculta dentro de una query o un Code. Es el mismo patrón del Bug 39 (rama FALSE del `If_openai_key_valid` que actualiza estado) aplicado en el sentido opuesto: no solo hay que asegurar que las ramas que deben actualizar estado lo hagan, también hay que asegurar que las ramas que NO deben propagar acciones tengan un corte explícito.
+
+Este bug también refuerza la lección del Bug 14 sobre dependencias implícitas: la conexión visible `Code_analizar_error_openai → PG_update_openai_key_status` en el canvas era literal, pero el operador humano que armó el diseño asumía que "el UPDATE se autolimitaría con su WHERE" — asumiendo una lógica de corte que no existe en n8n. El corte en n8n solo ocurre cuando (a) un nodo lanza excepción, (b) un IF envía por rama sin conexión, o (c) un Code devuelve array vacío con `return []`. Ninguno de esos 3 mecanismos estaba en el diseño original.
+
 
