@@ -1484,4 +1484,33 @@ En n8n, un nodo Code que "ejecuta exitosamente" (sin lanzar excepción) siempre 
 
 Este bug también refuerza la lección del Bug 14 sobre dependencias implícitas: la conexión visible `Code_analizar_error_openai → PG_update_openai_key_status` en el canvas era literal, pero el operador humano que armó el diseño asumía que "el UPDATE se autolimitaría con su WHERE" — asumiendo una lógica de corte que no existe en n8n. El corte en n8n solo ocurre cuando (a) un nodo lanza excepción, (b) un IF envía por rama sin conexión, o (c) un Code devuelve array vacío con `return []`. Ninguno de esos 3 mecanismos estaba en el diseño original.
 
+## Bug 43 — La query update_pipeline aceptaba y persistía cualquier valor del input de API key sin validación estructural
+
+**Panel:** `Config Bot` en Appsmith
+**Widget:** `inp_openai_api_key`
+**Query:** `update_pipeline` (UPSERT sobre `bot_config`)
+
+### Síntoma
+Aunque el sistema n8n tenía red de seguridad para detectar keys estructuralmente inválidas (Bug 39: `PG_update_status_desde_IF` en la rama FALSE del IF), el punto de ingreso original — el formulario de Appsmith — seguía aceptando cualquier valor. Esto tenía tres consecuencias operativas:
+
+1. Un admin editando el formulario para cambiar un campo no relacionado (tono, modelo, temperatura) podía borrar accidentalmente la key existente si el input password venía vacío al cargar y el admin no lo notaba antes de guardar.
+2. Al pegar una key con el prefijo `sk-` cortado (escenario original del Bug 37), la key mal formada se guardaba y el `openai_key_status` se reseteaba a `active` engañosamente. El badge del panel mostraba "Key Activa" pero el sistema estaba operativamente sin key.
+3. Cuando se guardaba una key inválida, el flujo n8n eventualmente la detectaba y la marcaba como `invalid`, pero el ciclo detección + notificación + corrección manual generaba ruido operativo evitable.
+
+### Causa raíz
+La query `update_pipeline` en su versión inicial (post-Bug 37 fix reactivo) hacía UPSERT sobre `bot_config` guardando el contenido del input tal como llegaba, con un simple `EXCLUDED.openai_api_key` en el DO UPDATE SET. No había ninguna validación estructural mínima antes de persistir el valor.
+
+Adicionalmente, el `openai_key_status` se forzaba a `active` en cada guardado (parte del reset automático de la Fuente 3 del módulo multi-tenant), sin condicionarlo a que la key nueva realmente pasara validación estructural. Esto significaba que un guardado con key mal formada dejaba el estado en `active` engañoso hasta que llegara el primer mensaje del cliente final y el auto-update lo corrigiera.
+
+### Cómo se destapó
+Revisión estratégica del código de la query durante la sesión de documentación y cierre de deudas técnicas. El operador priorizó cerrar el gap preventivo tras verificar que el sistema en producción seguía dependiendo de la detección reactiva en lugar de defensa proactiva en el punto de ingreso.
+
+### Fix
+Envolver los tres campos relacionados con la API key (`openai_api_key`, `openai_key_status`, `openai_key_fingerprint`) en expresiones `CASE WHEN` que validen estructura mínima antes de persistir. La validación aplica en dos ramas del UPSERT: en el INSERT (creación de tenant nuevo) y en el ON CONFLICT DO UPDATE (edición de tenant existente).
+
+**Regla de validación estructural:**
+```sql
+EXCLUDED.openai_api_key LIKE 'sk-%'
+  AND LENGTH(EXCLUDED.openai_api_key) >= 40
+
 
