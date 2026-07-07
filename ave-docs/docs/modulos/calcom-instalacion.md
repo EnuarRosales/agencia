@@ -1,54 +1,57 @@
-# Módulo: Cal.com Self-Hosted - Instalación Fase 1
+# Modulo: Cal.com Self-Hosted - Instalacion + OAuth Google Calendar
 
 **Proyecto:** AVE - agencIA
-**Fecha:** 06 jul 2026
-**Sesión:** Instalación base Cal.com self-hosted
-**Estado:** FASE 1 COMPLETADA
-**Versión Cal.com:** v6.2.0-sh (imagen `calcom/cal.com:latest`)
+**Fase 1 (instalacion base):** 06 jul 2026 - COMPLETADA
+**Fase 2 (OAuth Google Calendar):** 07 jul 2026 - COMPLETADA
+**Version Cal.com:** v6.2.0-sh (imagen `calcom/cal.com:latest`)
 **URL productiva:** https://citas.identechnology.co
+**Estado:** OPERATIVO - integracion bidireccional con Google Calendar validada
 
 ---
 
-## 1. Contexto y decisión de arquitectura
+## 1. Contexto y decision de arquitectura
 
 Cal.com self-hosted reemplaza las tools de Google Calendar del flujo principal
 de AVE. Se elige esta plataforma sobre alternativas por:
 
 - **vs Calendly (pago):** Cal.com self-hosted es AGPLv3, USD 0/mes.
-- **vs Cal.com Cloud (pago):** control total de datos, URL propia branded, sin
-  límite de usuarios.
+- **vs Cal.com Cloud (pago):** control total de datos, URL propia branded,
+  sin limite de usuarios.
 - **vs cal.diy (fork community):** cal.diy NO incluye Teams ni Organizations,
   imprescindibles para el modelo multi-tenant de AVE (agencIA, Uhane SAS,
   PC_Outlet, tienda4030). Se descarta.
 
-**Decisión:** imagen oficial `calcom/cal.com:latest` desde DockerHub, mantenida
-por el equipo de Cal.com desde nov-2025 (repo `calcom/docker` fue archivado).
+**Decision de imagen:** oficial `calcom/cal.com:latest` desde DockerHub,
+mantenida por el equipo de Cal.com desde nov-2025 (el repo `calcom/docker`
+fue archivado; el Dockerfile y docker-compose viven ahora en el monorepo
+`calcom/cal.com`).
 
-**Multi-tenancy:** se usará la feature **Teams** (incluida en AGPLv3). Cada
-empresa AVE será un Team con sus propios event types, calendarios conectados,
-webhooks y disponibilidad.
+**Multi-tenancy:** se usara la feature **Teams** (incluida en AGPLv3). Cada
+empresa AVE sera un Team con sus propios event types, calendarios conectados,
+webhooks y disponibilidad. Organizations (Enterprise) se evaluara solo si AVE
+crece a mas de 50 clientes con necesidad de sub-dominios propios.
 
 ---
 
 ## 2. Prerequisitos VPS validados
 
-VPS: Hostinger `srv1732020`, IP pública `2.25.172.227`.
+VPS: Hostinger `srv1732020`, IP publica `2.25.172.227`.
 
-| Recurso            | Valor                          | Estado |
-|--------------------|--------------------------------|--------|
-| Docker             | 29.5.3                         | OK     |
-| Docker Compose     | v5.1.4 (plugin, sin guion)     | OK     |
-| RAM total          | 15 Gi (11 Gi libres)           | OK     |
-| Disco raiz         | 193 Gi (177 Gi libres)         | OK     |
-| Traefik            | v2.11 en 80/443                | OK     |
-| Red Docker         | `traefik_network` (bridge)     | OK     |
-| Cert resolver ACME | `mytlschallenge` (Let's Encrypt) | OK   |
-| Email ACME         | enuaremiliorosales@gmail.com   | OK     |
+| Recurso            | Valor                            | Estado |
+|--------------------|----------------------------------|--------|
+| Docker             | 29.5.3                           | OK     |
+| Docker Compose     | v5.1.4 (plugin, sin guion)       | OK     |
+| RAM total          | 15 Gi (11 Gi libres al arranque) | OK     |
+| Disco raiz         | 193 Gi (177 Gi libres)           | OK     |
+| Traefik            | v2.11 en 80/443                  | OK     |
+| Red Docker         | `traefik_network` (bridge)       | OK     |
+| Cert resolver ACME | `mytlschallenge` (Let's Encrypt) | OK     |
+| Email ACME         | enuaremiliorosales@gmail.com     | OK     |
 
-**Contenedores ya operativos que coexisten con Cal.com:**
+**Contenedores que coexisten con Cal.com en el mismo VPS:**
 - `n8n-n8n-1`, `n8n-postgres-1` (n8n 2.23.3 + pgvector/pg16)
-- `chatwoot-chatwoot-1`, `chatwoot-chatwoot-worker-1`, `chatwoot-postgres-1`,
-  `chatwoot-redis-1`
+- `chatwoot-chatwoot-1`, `chatwoot-chatwoot-worker-1`,
+  `chatwoot-postgres-1`, `chatwoot-redis-1`
 - `ave-api` (backend AVE)
 - `appsmith-appsmith-1` (panel admin)
 - `traefik-traefik-1` (reverse proxy)
@@ -74,7 +77,7 @@ dig +short citas.identechnology.co
 
 ---
 
-## 4. Estructura de archivos
+## 4. Estructura de archivos - Fase 1
 
 Directorio base: `/opt/calcom/`
 
@@ -180,6 +183,7 @@ SMTP_PASSWORD=<REDACTED_HOVER_MAILBOX_PASSWORD>
 ```
 
 **Comandos usados para generar los secretos:**
+
 ```bash
 openssl rand -base64 32                                    # NEXTAUTH_SECRET
 openssl rand -base64 24                                    # CALENDSO_ENCRYPTION_KEY
@@ -188,7 +192,7 @@ openssl rand -base64 24 | tr -d '/+=' | cut -c1-32         # POSTGRES_PASSWORD
 
 ---
 
-## 5. Comandos de arranque
+## 5. Comandos de arranque y verificacion
 
 ```bash
 cd /opt/calcom
@@ -214,36 +218,35 @@ calcom            Up About a minute (healthy)   3000/tcp
 calcom-postgres   Up About a minute (healthy)   5432/tcp
 ```
 
-Los puertos NO se exponen al host; Traefik enruta desde `citas.identechnology.co`
-a `calcom:3000` por la red interna `traefik_network`.
+Los puertos NO se exponen al host; Traefik enruta desde
+`citas.identechnology.co` a `calcom:3000` por la red interna
+`traefik_network`.
 
 ---
 
-## 6. Verificacion de acceso
+## 6. Verificacion de acceso - Wizard inicial de Cal.com
 
 URL: **https://citas.identechnology.co**
 
-**Wizard inicial de Cal.com (3 pasos):**
+### Paso 1 - Usuario administrador
+- Usuario: `enuar`
+- Nombre Completo: `Enuar Emilio Rosales`
+- Email: `enuaremiliorosales@gmail.com`
+- Contrasena: >= 15 chars, mayus/minus, al menos 1 numero
+  (generada con `openssl rand -base64 20 | tr -d '/+=' | head -c 22`)
+- 2FA activado con Google Authenticator / Authy
 
-1. **Paso 1 - Usuario administrador**
-   - Usuario: `enuar`
-   - Nombre Completo: `Enuar Emilio Rosales`
-   - Email: `enuaremiliorosales@gmail.com`
-   - Contrasena: >= 15 chars, mayus/minus, al menos 1 numero
-     (ver TODO seccion 8: rotar a valor mas fuerte)
+### Paso 2 - Licencia
+- Seleccion: **Licencia AGPLv3** (gratis)
+- Accion: "Saltar paso" (equivale a aceptar AGPLv3 sin ingresar license
+  key Enterprise)
 
-2. **Paso 2 - Licencia**
-   - Seleccion: **Licencia AGPLv3** (gratis)
-   - Accion: "Saltar paso" (equivale a aceptar AGPLv3 sin ingresar
-     license key Enterprise)
+### Paso 3 - Activar aplicaciones
+- Todas las apps que requieren OAuth (Google Calendar, Google Meet, Zoom,
+  Office 365) se dejan en **OFF**.
+- La configuracion OAuth se realiza en Fase 2 (siguiente seccion).
 
-3. **Paso 3 - Activar aplicaciones**
-   - Todas las apps que requieren OAuth (Google Calendar, Google Meet,
-     Zoom, Office 365) se dejan en **OFF** por ahora.
-   - Se configuran en Fase 2 (requieren credenciales OAuth de Google Cloud
-     Console, Zoom Marketplace, Azure AD).
-
-**Verificacion final:**
+### Verificacion Fase 1
 - Panel admin accesible en `https://citas.identechnology.co/event-types`
 - Pagina publica accesible en `https://citas.identechnology.co/enuar`
 - SSL Let's Encrypt emitido automaticamente por Traefik
@@ -252,43 +255,177 @@ URL: **https://citas.identechnology.co**
 
 ---
 
-## 7. Notas de seguridad
+## 7. Fase 2 - OAuth Google Calendar
 
-**Secretos expuestos durante la sesion (rotar OBLIGATORIO):**
+**Objetivo:** que Cal.com pueda leer/escribir en el Google Calendar de
+cualquier usuario/tenant. Cuando un cliente reserva, el evento se crea
+automaticamente en el Google Calendar del propietario del calendar; y los
+bloqueos manuales del calendar impiden que se reserven esos slots.
 
-Durante el proceso de instalacion, se pegaron en el chat de asistencia los
-siguientes secretos que deben considerarse **comprometidos** y ser rotados:
+### 7.1 Google Cloud Console - Crear proyecto
+
+1. URL: https://console.cloud.google.com
+2. Loguearse con `enuaremiliorosales@gmail.com`
+3. Selector de proyectos -> **NEW PROJECT**
+4. Nombre: `ave-calcom-oauth`
+5. **Sin activar billing** (Google Calendar API es gratis en el free tier
+   hasta 1.000.000 requests/dia)
+
+**Decision:** proyecto SEPARADO del existente `n8n-30-05-2026` por
+separacion de responsabilidades, auditoria de accesos independiente, y
+para que rotaciones de credenciales de un proyecto no afecten al otro.
+
+### 7.2 Habilitar Google Calendar API
+
+1. En el proyecto `ave-calcom-oauth`: menu -> **APIs y servicios ->
+   Biblioteca**
+2. Buscar: `Google Calendar API`
+3. Click en la tarjeta -> **HABILITAR**
+4. Verificar que el boton pase a "ADMINISTRAR" (estado: Habilitada)
+
+### 7.3 Configurar Pantalla de consentimiento OAuth
+
+Menu lateral: **Google Auth Platform -> Pantalla de consentimiento**
+
+| Campo                | Valor                            |
+|----------------------|----------------------------------|
+| App name             | `AVE Citas`                      |
+| User support email   | `enuaremiliorosales@gmail.com`   |
+| Audience / User Type | **External**                     |
+| Contact email        | `enuaremiliorosales@gmail.com`   |
+| Estado publicacion   | **Testing** (NO publicar aun)    |
+
+**Por que External y no Internal:** Internal requiere Google Workspace
+organizacional. External permite que cualquier cuenta Google conecte
+(limitada a usuarios de prueba en modo Testing).
+
+### 7.4 Crear cliente OAuth 2.0
+
+Menu: **Google Auth Platform -> Clientes -> Crear cliente**
+
+| Campo                              | Valor                             |
+|------------------------------------|-----------------------------------|
+| Tipo de aplicacion                 | Aplicacion web                    |
+| Nombre                             | `AVE Citas - Cal.com`             |
+| Origenes JavaScript autorizados    | `https://citas.identechnology.co` |
+
+**URIs de redireccionamiento autorizadas (2 URIs):**
+
+```
+https://citas.identechnology.co/api/integrations/googlecalendar/callback
+https://citas.identechnology.co/api/integrations/googlevideo/callback
+```
+
+Al crear se muestran:
+- **ID de cliente** (formato: `<numero>-<hash>.apps.googleusercontent.com`)
+- **Secreto del cliente** (formato: `GOCSPX-<hash>`)
+
+Ambos deben guardarse en **gestor de contrasenas** (Bitwarden / 1Password /
+KeePassXC). El `client_secret` puede reobtenerse desde la vista de detalle
+del cliente (Google no lo oculta despues de la creacion, a diferencia de
+otros proveedores).
+
+### 7.5 Agregar usuarios de prueba
+
+Menu: **Google Auth Platform -> Publico -> Usuarios de prueba**
+
+Emails iniciales (Fase 2):
+- `enuaremiliorosales@gmail.com`
+- `info@identechnology.co` (solo si tiene cuenta Google asociada)
+
+Limite: **100 usuarios en modo Testing**. Cuando lleguen los tenants
+reales (Fase 3), agregar sus emails Google aqui. Solo emails listados aqui
+podran completar el flujo OAuth con la app en modo Testing.
+
+### 7.6 Pegar credenciales en Cal.com
+
+URL: **https://citas.identechnology.co/settings/admin/apps/calendar**
+
+1. Buscar tarjeta **Google Calendar** -> click en icono lapiz
+   (Editar claves)
+2. Rellenar los 3 campos:
+
+| Campo          | Valor                                                                    |
+|----------------|--------------------------------------------------------------------------|
+| `client_id`    | El generado en Google Cloud                                              |
+| `client_secret`| El generado en Google Cloud                                              |
+| `redirect_uris`| `https://citas.identechnology.co/api/integrations/googlecalendar/callback` |
+
+3. Guardar
+4. Activar el **toggle** de Google Calendar (queda en verde/ON)
+
+### 7.7 Prueba OAuth end-to-end
+
+1. Ir a **Ajustes -> Mi cuenta -> Calendarios** o URL directa
+   `https://citas.identechnology.co/apps/installed/calendar`
+2. En **App Store**, buscar Google Calendar -> **Install app**
+3. Popup Google: loguearse con `enuaremiliorosales@gmail.com`
+4. Aparece advertencia: **"Google no verificó esta app"**
+   - Es esperado en modo Testing, NO es peligroso
+   - Click **"Configuracion avanzada"** -> **"Ir a AVE Citas (no seguro)"**
+5. Pantalla de permisos -> **Permitir**
+6. Retorno automatico a Cal.com con Google Calendar conectado
+
+**Verificaciones bidireccionales confirmadas en produccion (07 jul 2026):**
+
+| Escenario                                    | Resultado |
+|----------------------------------------------|-----------|
+| Slot ocupado en Google Calendar              | Bloqueado automaticamente en Cal.com (OK) |
+| Reserva creada en Cal.com                    | Evento aparece en Google Calendar (OK) |
+| Cancelacion de cita en Cal.com               | Evento eliminado del Google Calendar (OK) |
+| Reagendamiento en Cal.com                    | (Pendiente validar Fase 3)                |
+
+---
+
+## 8. Notas de seguridad
+
+### 8.1 Secretos expuestos durante Fase 1 (rotar OBLIGATORIO)
+
+Durante el proceso de instalacion Fase 1 se pegaron en el chat de
+asistencia los siguientes secretos que deben considerarse
+**comprometidos** y ser rotados:
 
 - Password cuenta Hover (`enuar` -> panel hover.com)
 - Password buzon `info@identechnology.co`
 
-**Adicional:** el password admin inicial de Cal.com NO cumplio los 15
-caracteres minimos requeridos por la propia app (aparece banner naranja en
-el panel).
+### 8.2 Password admin Cal.com
 
-Todos los items estan en la seccion 8 (TODO).
+- Rotado a >= 15 caracteres el 07 jul 2026 (Bloque 1 de Fase 2)
+- 2FA activado con Google Authenticator / Authy
+- Codigos de recuperacion guardados en gestor seguro
+
+### 8.3 client_secret OAuth Google
+
+- Generado el 07 jul 2026 durante creacion del cliente OAuth
+- Guardado en gestor seguro (NO descargado como JSON por politica de
+  seguridad institucional del equipo)
+- Puede rotarse en cualquier momento desde:
+  Google Cloud Console -> Clientes -> AVE Citas - Cal.com -> Rotar secreto
+
+### 8.4 Buenas practicas aplicadas
+
+- `.env` con permisos `600` (solo root puede leer)
+- Postgres de Cal.com aislado en red interna `calcom_internal`
+- Cal.com no expone puertos al host (solo via Traefik)
+- SSL obligatorio (HTTP redirige a HTTPS via Traefik)
+- HSTS activo via Traefik
+- Modo Testing en OAuth (control de que emails pueden conectar)
 
 ---
 
-## 8. TODO al cierre de Fase 1
+## 9. TODO abiertos al cierre de Fase 2
 
-**Prioridad ALTA - Seguridad:**
+### Prioridad ALTA - Seguridad (pendientes de Fase 1)
 
-- [ ] Cambiar password admin Cal.com (>= 15 chars, mayus/minus, numeros)
-      -> Panel Cal.com -> Ajustes -> Seguridad -> Change password
-- [ ] Activar 2FA en Cal.com
-      -> Ajustes -> Security -> Two-Factor Authentication (Google
-      Authenticator / Authy)
 - [ ] Rotar password buzon `info@identechnology.co` en panel Hover
-      -> Hover -> Emails -> info@identechnology.co -> Change password
 - [ ] Actualizar `SMTP_PASSWORD` en `/opt/calcom/.env` con el nuevo password
-      del buzon
 - [ ] Reiniciar contenedor: `cd /opt/calcom && docker compose restart calcom`
-- [ ] Verificar envio SMTP: enviar booking de prueba y confirmar correo
+- [ ] Verificar envio SMTP: reservar una cita de prueba y confirmar
+      recepcion del correo
 - [ ] Rotar password cuenta Hover (usuario `enuar`)
 - [ ] Activar 2FA en cuenta Hover
 
-**Prioridad MEDIA - Operativo:**
+### Prioridad MEDIA - Operativo
 
 - [ ] Descartar los event types por defecto `Reunion de 15 min` y
       `Reunion de 30 min` si no se van a usar (o adaptarlos al estandar AVE)
@@ -296,103 +433,58 @@ Todos los items estan en la seccion 8 (TODO).
       (lun-vie 08:00-17:00 America/Bogota)
 - [ ] Backup automatizado del volumen `calcom_pgdata` (integrar con backup
       script existente del VPS)
+- [ ] Documentar procedimiento de restore desde backup
 
 ---
 
-## 9. Roadmap Fase 2 - OAuth integraciones
+## 10. Roadmap Fase 3 - Multi-tenant + integracion AVE
 
-**Objetivo:** habilitar la conexion de calendarios y videollamadas externos
-para los tenants.
+**Objetivo:** configurar el modelo multi-tenant en Cal.com y conectarlo al
+flujo principal de AVE (n8n + Postgres + Chatwoot).
 
-### 9.1 Google Calendar + Google Meet
+### 10.1 Crear Teams (uno por empresa)
 
-1. Ir a https://console.cloud.google.com
-2. Crear proyecto: `ave-calcom-oauth`
-3. Habilitar APIs:
-   - Google Calendar API
-   - Google Meet API (via Calendar API)
-4. Configurar pantalla de consentimiento OAuth:
-   - Tipo: **External** (Testing mode inicial)
-   - App name: `AVE Citas`
-   - Support email: `info@identechnology.co`
-   - Authorized domains: `identechnology.co`
-   - Scopes: `.../auth/calendar`, `.../auth/calendar.events`
-5. Crear OAuth 2.0 Client ID:
-   - Application type: **Web application**
-   - Authorized redirect URIs:
-     - `https://citas.identechnology.co/api/integrations/googlecalendar/callback`
-     - `https://citas.identechnology.co/api/integrations/googlemeet/callback`
-6. Copiar `client_id` y `client_secret`
-7. En Cal.com: Aplicaciones -> Calendario -> Google Calendar -> Editar claves
-   -> pegar `client_id`, `client_secret`, `redirect_uris` -> Guardar
+En Cal.com: **Equipos -> Crear equipo**
 
-### 9.2 Zoom
-
-1. Ir a https://marketplace.zoom.us
-2. Crear app: **OAuth** (User-managed)
-3. Redirect URL: `https://citas.identechnology.co/api/integrations/zoom/callback`
-4. Scopes: `meeting:write`, `meeting:read`
-5. En Cal.com: Aplicaciones -> Conferencias -> Zoom -> Editar claves
-
-### 9.3 Office 365 / Outlook Calendar (opcional)
-
-Solo si algun tenant corporativo lo requiere.
-1. Ir a https://portal.azure.com -> Azure Active Directory -> App registrations
-2. New registration -> Redirect URI:
-   `https://citas.identechnology.co/api/integrations/office365calendar/callback`
-
----
-
-## 10. Roadmap Fase 3 - Teams multi-tenant + integracion AVE
-
-**Objetivo:** configurar el modelo multi-tenant y conectar Cal.com al flujo
-principal de AVE (n8n + Postgres + Chatwoot).
-
-### 10.1 Crear Teams
-
-En Cal.com -> Equipos -> Crear equipo. Uno por empresa:
-
-- `agencia` (empresa_id = 1)
-- `uhane` (empresa_id = 7)
-- `pcoutlet` (empresa_id = 8)
-- `tienda4030` (empresa_id = 9)
+| Team slug     | Empresa      | empresa_id |
+|---------------|--------------|------------|
+| agencia       | agencIA      | 1          |
+| uhane         | Uhane SAS    | 7          |
+| pcoutlet      | PC_Outlet    | 8          |
+| tienda4030    | tienda4030   | 9          |
 
 Cada team tendra:
-- URL propia: `citas.identechnology.co/<team>`
+- URL propia: `https://citas.identechnology.co/<team>`
 - Sus propios event types
 - Sus propios miembros
-- Su propio calendario conectado
+- Su propio calendario Google conectado
+- Su propio branding basico
 
-### 10.2 Conectar Google Calendar por tenant
+### 10.2 Onboarding OAuth por tenant
 
-Cada tenant conecta su Google Calendar corporativa desde el panel de su
-team (requiere Fase 2 completa).
+Para cada tenant nuevo:
+1. Obtener email Google del propietario del calendar (owner del team)
+2. Google Cloud Console -> Publico -> Usuarios de prueba -> Agregar email
+3. Owner del team se loguea en Cal.com, va a Ajustes -> Calendarios ->
+   Install app (Google Calendar) -> autoriza con su cuenta
+4. Verificar que aparece su calendar en Installed apps del team
 
-### 10.3 Webhooks Cal.com -> n8n
+### 10.3 Definir event types por team
 
-En Cal.com -> Ajustes -> Desarrollador -> Webhooks:
+Ejemplos por tipo de negocio:
+- **agencIA:** Consulta estrategica 45min, Demo producto 30min, Discovery
+  call 60min
+- **Uhane SAS:** Sesion yoga privada 60min, Consulta wellness 30min
+- **PC_Outlet:** Cotizacion equipo 20min, Soporte tecnico 30min
+- **tienda4030:** Cita en tienda 15min
 
-- URL: `https://hn8n.identechnology.co/webhook/calcom-booking`
-- Eventos:
-  - `BOOKING_CREATED`
-  - `BOOKING_RESCHEDULED`
-  - `BOOKING_CANCELLED`
-  - `MEETING_ENDED`
-- Secret: generar y guardar en n8n para validar HMAC
+Configurar para cada uno:
+- Duracion
+- Buffer time (10min antes/despues)
+- Minimo aviso previo (2h)
+- Descripcion, ubicacion (Google Meet auto-generado o presencial)
 
-### 10.4 Workflow n8n para procesar bookings
-
-Crear workflow `calcom-booking-handler` que:
-1. Reciba webhook
-2. Valide HMAC signature
-3. Identifique empresa (por team_slug o event_type)
-4. Inserte/actualice registro en tabla `citas` de Postgres AVE
-5. Actualice `estado_lead` en tabla `leads`
-6. Envie confirmacion por WhatsApp via Chatwoot API
-7. Encole recordatorio (24h antes) usando el sistema existente de
-   recordatorios blindado
-
-### 10.5 Tabla `citas` en Postgres AVE
+### 10.4 Tabla `citas` en Postgres AVE
 
 Schema propuesto (a validar en sesion Fase 3):
 
@@ -417,33 +509,98 @@ CREATE TABLE citas (
 CREATE INDEX idx_citas_empresa ON citas(empresa_id);
 CREATE INDEX idx_citas_lead ON citas(lead_id);
 CREATE INDEX idx_citas_fecha ON citas(fecha_cita);
+CREATE INDEX idx_citas_estado ON citas(estado);
 ```
+
+### 10.5 Webhooks Cal.com -> n8n
+
+En Cal.com -> **Ajustes -> Desarrollador -> Webhooks:**
+
+- URL destino: `https://hn8n.identechnology.co/webhook/calcom-booking`
+- Eventos suscritos:
+  - `BOOKING_CREATED`
+  - `BOOKING_RESCHEDULED`
+  - `BOOKING_CANCELLED`
+  - `MEETING_ENDED`
+- Secret HMAC: generar en Cal.com y guardar en n8n para validar firma
+- Formato: JSON POST
+
+**Workflow n8n `calcom-booking-handler`:**
+
+1. Nodo Webhook: recibe POST de Cal.com
+2. Nodo Function: valida HMAC signature con el secret
+3. Nodo Switch: identifica empresa por `team_slug` del payload
+4. Nodo Postgres: inserta / actualiza registro en tabla `citas`
+5. Nodo Postgres: actualiza `estado_lead` en tabla `leads` segun evento
+   (BOOKING_CREATED -> `agendado`, CANCELLED -> `cancelado`, etc.)
+6. Nodo HTTP Request: envia confirmacion por WhatsApp via Chatwoot API
+7. Nodo Postgres: encola recordatorio 24h antes usando el sistema
+   blindado con contador secuencial `recordatorios_enviados`
+
+**Coherencia con el sistema existente:**
+- Aprovechar el patron `isExecuted` de n8n 2.23.3 aplicado en
+  workflows de openai-multitenant
+- Refuerzo estructural en `update_pipeline` para prevenir keys mal
+  formadas (ya aplicado en 43 bugs previos)
+- Contador secuencial de recordatorios blindado (fix aplicado:
+  quitar reset en flujo principal)
 
 ---
 
-## 11. Referencias
+## 11. Roadmap Fase 4 (futuro) - OAuth adicional y publicacion
 
-- Cal.com repo oficial: https://github.com/calcom/cal.com
-- Imagen DockerHub oficial: https://hub.docker.com/r/calcom/cal.com
-- Docs self-hosting: https://cal.com/docs/self-hosting
-- Cal.com v5.9 (Docker oficial en monorepo):
-  https://cal.com/blog/calcom-v5-9
-- Traefik v2 docs (labels Docker): https://doc.traefik.io/traefik/v2.11/
-- Let's Encrypt ACME challenge: https://letsencrypt.org/docs/challenge-types/
+### 11.1 OAuth Zoom (opcional segun necesidad de tenants)
+
+Cuando algun tenant requiera video-llamadas via Zoom (en lugar de Google
+Meet por defecto):
+
+1. URL: https://marketplace.zoom.us
+2. Crear app tipo **OAuth (User-managed)**
+3. Redirect URL:
+   `https://citas.identechnology.co/api/integrations/zoom/callback`
+4. Scopes: `meeting:write`, `meeting:read`
+5. Pegar credenciales en Cal.com -> Apps -> Conferencing -> Zoom
+
+### 11.2 OAuth Office 365 / Outlook (opcional para tenants MS365)
+
+Solo si algun tenant corporativo lo requiere:
+
+1. URL: https://portal.azure.com
+2. Azure Active Directory -> App registrations -> New registration
+3. Redirect URI:
+   `https://citas.identechnology.co/api/integrations/office365calendar/callback`
+4. API permissions: Calendars.ReadWrite (delegated)
+5. Certificates & secrets -> New client secret
+
+### 11.3 Publicacion oficial de la app OAuth (Google)
+
+**Trigger:** cuando AVE supere ~50 clientes activos o requiera abrir el
+sistema al publico general sin agregar cada email manualmente.
+
+Requiere:
+- Politica de privacidad publicada en dominio identechnology.co
+- Terminos de servicio publicados
+- Verificacion de propiedad del dominio (via Search Console)
+- Justificacion escrita de por que se piden scopes sensibles de Calendar
+- Proceso de revision de Google: 2-6 semanas
+
+Beneficio: quitar la advertencia "Google no verifico esta app", eliminar
+el limite de 100 usuarios de prueba, permitir onboarding self-service de
+tenants sin intervencion manual en Google Cloud Console.
 
 ---
 
 ## 12. Comandos de mantenimiento
 
 ```bash
-# Actualizar Cal.com a version mas reciente
+# Actualizar Cal.com a la version mas reciente
 cd /opt/calcom
 docker compose pull
 docker compose down
 docker compose up -d
 
-# Ver logs de un rango
-docker compose logs --since 1h calcom
+# Ver logs del ultimo dia
+docker compose logs --since 24h calcom
 
 # Backup manual del volumen Postgres
 docker exec calcom-postgres pg_dump -U calcom calcom > \
@@ -453,13 +610,40 @@ docker exec calcom-postgres pg_dump -U calcom calcom > \
 docker exec -i calcom-postgres psql -U calcom calcom < \
   /root/backups/calcom-YYYYMMDD-HHMMSS.sql
 
-# Entrar a la BD
+# Entrar a la BD interactivamente
 docker exec -it calcom-postgres psql -U calcom -d calcom
 
 # Ver uso de recursos del stack
 docker stats calcom calcom-postgres
+
+# Reiniciar solo el contenedor calcom (por ejemplo tras cambio en .env)
+cd /opt/calcom && docker compose restart calcom
+
+# Verificar que la app este saludable
+curl -I https://citas.identechnology.co
+# Esperar HTTP 200 o 307 (redirect a login)
 ```
 
 ---
 
-**Fin del modulo Fase 1.**
+## 13. Referencias
+
+- Cal.com repo oficial: https://github.com/calcom/cal.com
+- Imagen DockerHub oficial: https://hub.docker.com/r/calcom/cal.com
+- Docs self-hosting: https://cal.com/docs/self-hosting
+- Cal.com v5.9 (Docker oficial en monorepo):
+  https://cal.com/blog/calcom-v5-9
+- Traefik v2 docs (labels Docker):
+  https://doc.traefik.io/traefik/v2.11/
+- Let's Encrypt ACME challenge:
+  https://letsencrypt.org/docs/challenge-types/
+- Google Cloud Console: https://console.cloud.google.com
+- Google Calendar API docs:
+  https://developers.google.com/calendar/api/guides/overview
+- OAuth 2.0 for Google APIs:
+  https://developers.google.com/identity/protocols/oauth2
+
+---
+
+**Fin del documento. Fase 1 + Fase 2 COMPLETADAS.**
+**Proximo paso: Fase 3 - Multi-tenant + integracion con AVE.**
