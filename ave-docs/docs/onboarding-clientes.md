@@ -1,358 +1,466 @@
-# Onboarding de Nuevos Clientes + Git
+# Onboarding de Clientes - Proyecto AVE
 
-Guía operativa para dar de alta una empresa nueva en AVE bajo la arquitectura sándwich de prompts multi-tenant, y para versionar el proyecto en Git de forma segura.
-
----
-
-## Parte A — Onboarding de un cliente nuevo (arquitectura sándwich)
-
-Checklist para agregar una empresa al sistema multi-tenant. Ejemplo referencia basado en tienda4030 (empresa_id=9), migrada el 12 jul 2026.
-
-**Duración estimada:** 45-60 minutos para un tenant completo con datos, prompts y validación.
-
-**Documentos relacionados:**
-- `docs/modulos/arquitectura-prompts-sandwich.md` — arquitectura de 3 capas + módulos
-- `docs/modulos/panel-cliente-appsmith.md` — setup del Panel Cliente
-- `docs/troubleshooting/bugs-resueltos.md` bugs 44-49 — errores comunes a evitar
-
-### A.1 Base de datos
-
-1. Crear registro en `empresas` con `chatwoot_account_id` correspondiente. Anotar el `id` retornado (será el `empresa_id` en todos los pasos siguientes).
-
-    ```sql
-    INSERT INTO empresas (nombre, plan, email, telefono, chatwoot_account_id, activo)
-    VALUES ('Nombre Comercial', 'basic', 'contacto@cliente.com', '3001234567', <CHATWOOT_ACCT_ID>, true)
-    RETURNING id;
-    ```
-
-2. Crear `bot_config` con configuración base. **NO llenar `system_prompt` viejo**; se usarán `prompt_capa_cliente` y `prompt_capa_reglas_fin` en el paso A.4.
-
-    ```sql
-    INSERT INTO bot_config (
-        empresa_id, 
-        objetivo_bot, 
-        tono, 
-        modelo_bot, 
-        modelo_clasificador,
-        temperatura_bot, 
-        max_tokens_bot, 
-        openai_api_key,
-        openai_key_status,
-        prompt_clasificador,
-        activo
-    ) VALUES (
-        <EMPRESA_ID>,
-        'Placeholder objetivo - editar despues desde Panel Cliente',
-        'Placeholder tono',
-        'gpt-4o-mini',
-        'gpt-4o-mini',
-        0.7,
-        1500,
-        NULL,
-        'no_config',
-        'Clasifica leads como frio, tibio, caliente segun interes...',
-        true
-    );
-    ```
-
-3. Cargar `servicios` (productos/servicios del cliente).
-4. Cargar `info_negocio` (categorías de información: precios, envios, caracteristicas, contacto, etc.).
-5. Definir `etiquetas_pipeline` con el campo `es_conversion` marcado en la(s) etiqueta(s) de conversión.
-6. Configurar `recordatorio_config` (orden, horas_despues, mensaje, activo).
-
-### A.2 Chatwoot
-
-1. Crear el inbox de WhatsApp Business API en la cuenta del cliente.
-2. Generar el token de sistema (System User token) en Meta Business Manager.
-3. Crear las etiquetas (labels) que coincidan con `etiquetas_pipeline`.
-4. Confirmar que existen los custom attributes a nivel conversación: `estado_lead`, `desactivar_bot`, `en_seguimiento`.
-
-### A.3 Módulos del bot en tablas de arquitectura sándwich
-
-1. Decidir qué módulos activar según las tools que usará el bot:
-
-    | Módulo | Cuándo activar |
-    |---|---|
-    | `NUCLEO` | **Siempre** (obligatorio para todos) |
-    | `AGENDAMIENTO` | Si usa `ver_disponibilidad_calcom` y/o `agendar_cita_calcom` |
-    | `MEDIOS` | Si usa `buscar_media_servicio` para enviar imágenes/videos/PDFs |
-    | `PEDIDOS` | Si usa `registrar_pedido` para venta directa por WhatsApp |
-
-2. Activar los módulos en `empresa_modulos`:
-
-    ```sql
-    -- NUCLEO siempre
-    INSERT INTO empresa_modulos (empresa_id, modulo_id, activo)
-    VALUES (<EMPRESA_ID>, (SELECT id FROM modulos_bot WHERE codigo = 'NUCLEO'), true)
-    ON CONFLICT (empresa_id, modulo_id) DO UPDATE SET activo = true;
-    
-    -- Otros según aplique
-    INSERT INTO empresa_modulos (empresa_id, modulo_id, activo)
-    VALUES 
-        (<EMPRESA_ID>, (SELECT id FROM modulos_bot WHERE codigo = 'MEDIOS'), true),
-        (<EMPRESA_ID>, (SELECT id FROM modulos_bot WHERE codigo = 'PEDIDOS'), true)
-    ON CONFLICT (empresa_id, modulo_id) DO UPDATE SET activo = true;
-    ```
-
-3. Verificar módulos activos:
-
-    ```sql
-    SELECT mb.codigo, mb.orden, em.activo
-    FROM empresa_modulos em
-    JOIN modulos_bot mb ON mb.id = em.modulo_id
-    WHERE em.empresa_id = <EMPRESA_ID>
-    ORDER BY mb.orden;
-    ```
-
-### A.4 Redactar y persistir Capa 2 (personalidad) y Capa 3 (guardrails)
-
-Ver `docs/modulos/arquitectura-prompts-sandwich.md` sección 5 y 6 para la metodología completa. Aquí el resumen operativo:
-
-1. **Redactar Capa 2 (`prompt_capa_cliente`)**: identidad del bot, saludo textual, tono, flujo comercial, argumentos de venta, preguntas frecuentes, casos especiales. Ver ejemplos de longitud típica: 4,000-15,000 chars según complejidad del negocio.
-
-2. **Redactar Capa 3 (`prompt_capa_reglas_fin`)**: guardrails de seguridad. Longitud típica: 1,000-2,500 chars. **Reglas críticas de redacción**:
-   - NO mencionar "NUCLEO", "reglas del sistema", "capas anteriores" (ver Bug 45)
-   - Usar imperativo directo: `"NUNCA hagas X"`, `"SIEMPRE responde Y"`
-   - Si el prompt total supera 10,000 chars, incluir regla anti-fuga como PRIMERA sección
-   - Reglas anti-captura de nombre errónea si el bot captura nombre del cliente (ver Bug 46)
-
-3. **Backup previo obligatorio**:
-
-    ```sql
-    CREATE TABLE IF NOT EXISTS backup_bot_config_<TENANT>_YYYYMMDD AS
-    SELECT * FROM bot_config WHERE empresa_id = <EMPRESA_ID>;
-    ```
-
-4. **UPDATE con delimitador `$BODY$`** (nunca `$$` — ver Bug 44):
-
-    ```sql
-    UPDATE bot_config
-    SET 
-        prompt_capa_cliente = $BODY$<CONTENIDO_CAPA_2>$BODY$,
-        prompt_capa_reglas_fin = $BODY$<CONTENIDO_CAPA_3>$BODY$,
-        updated_at = NOW()
-    WHERE empresa_id = <EMPRESA_ID>;
-    ```
-
-5. **Verificación obligatoria con LENGTH** (para detectar bug de delimitador):
-
-    ```sql
-    SELECT 
-        LENGTH(prompt_capa_cliente) AS chars_capa_2,
-        LENGTH(prompt_capa_reglas_fin) AS chars_capa_3,
-        LEFT(prompt_capa_cliente, 100) AS inicio_capa_2,
-        RIGHT(prompt_capa_cliente, 100) AS final_capa_2,
-        LEFT(prompt_capa_reglas_fin, 100) AS inicio_capa_3,
-        RIGHT(prompt_capa_reglas_fin, 100) AS final_capa_3
-    FROM bot_config
-    WHERE empresa_id = <EMPRESA_ID>;
-    ```
-
-    Si algún `chars_capa_*` es visiblemente menor a lo redactado (ej: 75 chars cuando se esperaba 1,500), hay bug de delimitador. Hacer rollback y reintentar.
-
-### A.5 Configurar acceso al Panel Cliente Appsmith
-
-1. Registrar el email del cliente en `usuarios_cliente`:
-
-    ```sql
-    INSERT INTO usuarios_cliente (email, empresa_id, nombre, rol, activo)
-    VALUES ('cliente@empresa.com', <EMPRESA_ID>, 'Nombre Contacto', 'admin_cliente', true);
-    ```
-
-2. Verificar que la vista `v_usuario_empresa` devuelve UNA sola fila:
-
-    ```sql
-    SELECT * FROM v_usuario_empresa WHERE email = 'cliente@empresa.com';
-    ```
-
-    Si devuelve más de una fila, revisar Bug 47 en `bugs-resueltos.md`.
-
-3. Crear workspace en Appsmith con el nombre del tenant (ej: `MI-EMPRESA`).
-4. Forkear la app "Panel Cliente" plantilla desde `enuar's apps` al workspace nuevo.
-5. **Auditar TODAS las queries del fork** buscando valores hardcodeados (ver Bugs 48 y 49):
-   - Filtros literales tipo `WHERE empresa_id = 1`
-   - Emails literales tipo `WHERE email = 'admin@algo.com'`
-   - Reemplazar por expresiones dinámicas:
-     - `WHERE empresa_id = {{q_get_usuario_actual.data[0].empresa_id}}`
-     - `WHERE email = '{{appsmith.user.email}}'`
-6. Invitar al cliente en el workspace con rol **App Viewer** (nunca Administrator ni Developer).
-
-### A.6 n8n
-
-1. Confirmar que el webhook de Chatwoot apunta al workflow principal.
-2. Activar el workflow de recordatorios (es genérico, ya incluye la empresa nueva automáticamente al estar `activo = true`).
-
-### A.7 Prueba end-to-end
-
-1. Escribir por WhatsApp desde un número de prueba y validar:
-    - Saludo del bot con la personalidad correcta del tenant.
-    - **Sin fugas de razonamiento en inglés** (ver Bug 45).
-    - **Sin extracción errónea de fragmentos como nombre** (ver Bug 46).
-2. Simular flujo comercial completo del negocio (pregunta por precio, cotización, cierre, o transferencia según aplique).
-3. Validar clasificación de etiquetas.
-4. Validar apagado de `en_seguimiento` al convertir.
-5. Validar recepción de recordatorios.
-6. Desde el navegador del cliente (o incógnito), acceder a `admin.identechnology.co`:
-    - Login con el email registrado.
-    - Verificar que solo ve el workspace de su tenant.
-    - Abrir el Panel Cliente y confirmar que todos los tabs muestran datos correctos (Dashboard, Mi Empresa, Info Negocio, Servicios, Config Bot, Config Recordatorios).
+**Version:** 3.0
+**Fecha:** 2026-07-13
+**Autor:** SS. Enuar Emilio Rosales Salazar
+**Estado:** Vigente - actualizado tras refactor arquitectura sandwich
 
 ---
 
-## Parte B — Versionar AVE en Git de forma segura
+## Indice
 
-### B.1 Estructura recomendada del repositorio
-
-```
-ave-plataforma/
-├── README.md
-├── .gitignore
-├── docs/
-│   ├── arquitectura.md
-│   ├── base-de-datos/
-│   │   ├── esquema.md
-│   │   └── reglas-timezone.md
-│   ├── infraestructura/
-│   │   └── conexion-dbeaver.md
-│   ├── modulos/
-│   │   ├── calcom-instalacion.md
-│   │   ├── desactivar-bot.md
-│   │   ├── etiquetas-seguimiento-prioridad.md
-│   │   ├── notificaciones-openai-key.md
-│   │   ├── openai-multitenant.md
-│   │   ├── panel-cliente-appsmith.md
-│   │   ├── arquitectura-prompts-sandwich.md
-│   │   ├── recordatorios.md
-│   │   └── seguimiento.md
-│   ├── onboarding-clientes/
-│   │   ├── onboarding-clientes.md
-│   │   └── whatsapp-meta-setup.md
-│   ├── promps/
-│   │   └── guia-maestra-prompts-ave.md
-│   └── troubleshooting/
-│       ├── bugs-resueltos.md
-│       ├── onboarding-clientes.md
-│       └── tipos-de-etiquetas.md
-├── workflows/
-│   ├── Bot_Agencia_final.clean.json      ← SIN credenciales
-│   └── AVE_Recordatorios.clean.json      ← SIN credenciales
-└── sql/
-    └── migraciones/
-        ├── 001_normalizar_empresas.sql
-        ├── 002_en_seguimiento_activo.sql
-        └── ...
-```
-
-### B.2 ⚠️ Limpieza de workflows para Git
-
-Los exports de n8n contienen **credenciales en texto plano**. Antes de versionar cualquier `.json`:
-
-**Datos sensibles que aparecen en los JSON:**
-- `openai_api_key` (en `PG_get_empresa`, `OpenAI_generar`, etc.)
-- `chatwoot_api_key`
-- IDs de credenciales de n8n
-
-**Procedimiento de limpieza:**
-
-Opción 1 — Reemplazar valores por placeholders antes de commitear:
-```bash
-sed -E 's/"sk-proj-[A-Za-z0-9_-]+"/"REDACTED_OPENAI_KEY"/g' Bot_Agencia_final.json > Bot_Agencia_final.clean.json
-```
-
-Opción 2 — Los tokens reales viven en las **credenciales de n8n** (no en el JSON del nodo), así que al exportar, n8n normalmente solo deja el ID de credencial, no el secreto. Pero los `api_key` que están como **datos en queries SQL** (ej. el SELECT de `PG_get_empresa` trae `chatwoot_api_key` de la BD) NO son secretos en el JSON — son nombres de columna. El riesgo real está en valores hardcodeados dentro de expresiones o headers.
-
-**Regla de oro:** antes de cada commit, hacer `git diff` y buscar visualmente cualquier `sk-`, `Bearer`, token largo, o password. El `.gitignore` incluido bloquea patrones comunes, pero la revisión manual es la última línea de defensa.
-
-### B.3 Flujo de trabajo Git sugerido
-
-```bash
-# Primera vez
-cd ave-plataforma
-git init
-git add .
-git commit -m "docs: estructura inicial de documentacion AVE"
-git remote add origin git@github.com:tu-usuario/ave-plataforma.git
-git push -u origin main
-
-# Cada cambio posterior
-git add docs/modulos/recordatorios.md
-git commit -m "docs: agregar troubleshooting de timezone en recordatorios"
-git push
-```
-
-### B.4 Convención de mensajes de commit
-
-| Prefijo | Uso |
-|---|---|
-| `feat:` | Nueva funcionalidad o módulo |
-| `fix:` | Corrección de un bug |
-| `docs:` | Solo cambios de documentación |
-| `refactor:` | Reestructuración sin cambiar comportamiento |
-| `chore:` | Mantenimiento, limpieza, configuración |
-
-Ejemplos reales:
-- `fix: en_seguimiento se borraba en cada turno por reemplazo de custom_attributes`
-- `fix: error de memoria por entrada ambigua al AI Agent`
-- `feat: sistema generico de seguimiento con en_seguimiento_activo`
-- `fix: timezone en comparacion de ultimo_recordatorio_at (columna with time zone)`
-- `feat: arquitectura sandwich de prompts con modulos_bot y empresa_modulos`
-- `fix: v_usuario_empresa con UNION ALL para precedencia de usuarios_cliente`
-- `docs: bugs 44-49 sobre delimitador $BODY$ y fugas de razonamiento del LLM`
+1. [Introduccion y vision general](#1-introduccion-y-vision-general)
+2. [Prerequisitos](#2-prerequisitos)
+3. [Fase 1 - Registro base](#3-fase-1-registro-base)
+4. [Fase 2 - Activacion de modulos](#4-fase-2-activacion-de-modulos)
+5. [Fase 3 - Redaccion de Capa 2](#5-fase-3-redaccion-de-capa-2)
+6. [Fase 4 - Validacion end-to-end](#6-fase-4-validacion-end-to-end)
+7. [Fase 5 - Entrega al cliente](#7-fase-5-entrega-al-cliente)
+8. [Estado actual de los 4 tenants](#8-estado-actual-de-los-4-tenants)
+9. [Preguntas frecuentes](#9-preguntas-frecuentes)
+10. [Referencias cruzadas](#10-referencias-cruzadas)
 
 ---
 
-## Parte C — Estado actual de los tenants
+## 1. Introduccion y vision general
 
-Al 12 de julio de 2026, los 4 tenants están migrados a la arquitectura sándwich:
+Este documento describe el flujo actualizado para incorporar nuevos clientes al SaaS multi-tenant AVE bajo la arquitectura sandwich refactorizada del 2026-07-13.
 
-| Tenant | empresa_id | Módulos activos | Capa 2 chars | Capa 3 chars | Estado |
-|---|---|---|---|---|---|
-| agencIA | 1 | NUCLEO + AGENDAMIENTO + MEDIOS | 5,489 | 2,058 | Producción |
-| Uhane SAS | 7 | NUCLEO + MEDIOS + PEDIDOS | 4,176 | 1,178 | Producción, $11.4M COP en pedidos reales |
-| PC_Outlet | 8 | NUCLEO + MEDIOS | 13,883 | 2,452 | Producción, modelo cierre humano |
-| tienda4030 | 9 | NUCLEO + MEDIOS + PEDIDOS | 6,686 | 1,487 | Producción |
+### Objetivo
 
-Backups preservados en tablas `backup_bot_config_<tenant>_20260712` y `system_prompt` viejo intacto en cada tenant como respaldo permanente.
+Que cualquier nuevo tenant pueda ser aprovisionado, configurado, validado y entregado en una sesion de trabajo, con aislamiento multi-tenant garantizado y sin exposicion de detalles tecnicos al cliente final.
+
+### Duracion estimada
+
+- Fase 1 (Registro base): 10 minutos
+- Fase 2 (Activacion modulos): 5 minutos
+- Fase 3 (Redaccion Capa 2): 60 a 120 minutos (segun complejidad del negocio)
+- Fase 4 (Validacion): 30 a 60 minutos
+- Fase 5 (Entrega): 20 minutos
+- **Total: 2 a 4 horas** por tenant nuevo.
+
+### Roles
+
+- **Operador AVE:** ejecuta las Fases 1, 2, 3 y 4. Es la unica persona con acceso a modulos globales, Panel Admin y BD directa.
+- **Cliente final:** recibe invitacion al Panel Cliente Appsmith en Fase 5, edita su propia Capa 2 y consulta KPIs.
 
 ---
 
-## Parte D — Checklist final de verificación post-onboarding
+## 2. Prerequisitos
 
-Antes de considerar un tenant como "listo para producción", validar todos los ítems:
+### 2.1 Infraestructura AVE operativa
 
-### D.1 Base de datos
-- [ ] Registro en `empresas` con `chatwoot_account_id` correcto
-- [ ] Registro en `bot_config` con `activo = true`
-- [ ] `LENGTH(prompt_capa_cliente)` coincide con lo redactado
-- [ ] `LENGTH(prompt_capa_reglas_fin)` coincide con lo redactado
-- [ ] `LEFT()` y `RIGHT()` de las capas devuelven texto esperado (no SQL basura — Bug 44)
-- [ ] Módulos correctos activos en `empresa_modulos`
-- [ ] `servicios` y `info_negocio` cargados
-- [ ] `etiquetas_pipeline` con `es_conversion` correcto
-- [ ] `recordatorio_config` configurado y activo
-- [ ] Backup de la sesión respaldado en tabla `backup_bot_config_<tenant>_YYYYMMDD`
+- [ ] VPS Hostinger en Colombia con Docker Compose corriendo.
+- [ ] Workflow n8n TEST-PRINCIPAL activo.
+- [ ] Chatwoot operativo en `chatwoot.identechnology.co`.
+- [ ] Postgres AVE con las tablas base creadas y los 5 modulos globales cargados.
+- [ ] Panel Admin operativo.
+- [ ] Panel Cliente Appsmith operativo en `admin.identechnology.co`.
+- [ ] SMTP Hover configurado en Appsmith (para invitaciones).
 
-### D.2 Chatwoot
-- [ ] Inbox WhatsApp activo con token válido
-- [ ] Labels creados y sincronizados con `etiquetas_pipeline`
-- [ ] Custom attributes de conversación existentes
+### 2.2 Datos requeridos del cliente
 
-### D.3 Appsmith Panel Cliente
-- [ ] Usuario del cliente registrado en `usuarios_cliente`
-- [ ] `v_usuario_empresa` devuelve UNA sola fila para ese email (no duplicados — Bug 47)
-- [ ] Workspace del tenant creado
-- [ ] App forkeada al workspace nuevo
-- [ ] Auditoría de queries completada (sin valores hardcodeados — Bugs 48-49)
-- [ ] Cliente invitado con rol **App Viewer**
-- [ ] Correo de invitación recibido por el cliente
+Antes de iniciar el onboarding, recopilar del cliente:
 
-### D.4 Prueba end-to-end
-- [ ] Saludo del bot con personalidad correcta
-- [ ] Consulta a `info_negocio_pg` antes de responder precios
-- [ ] Sin fugas de razonamiento en inglés (Bug 45)
-- [ ] Sin captura errónea de nombre del cliente (Bug 46)
-- [ ] Flujo comercial completo funciona (venta / agendamiento / transferencia)
-- [ ] Cliente accede a Panel Cliente y ve datos correctos en todos los tabs
-- [ ] Sistema de recordatorios activo y enviando correctamente
+- [ ] Nombre comercial de la empresa.
+- [ ] NIT (si aplica).
+- [ ] Correo del administrador que accedera al Panel Cliente.
+- [ ] Numero de WhatsApp Business que se conectara a Chatwoot.
+- [ ] Modelo de negocio: dropshipping, servicios con agendamiento, venta consultiva, etc.
+- [ ] Objetivo comercial principal del bot (ejemplo: agendar diagnosticos, capturar pedidos, calificar leads).
+- [ ] Tono deseado (formal, informal, con emojis, sin emojis).
+- [ ] Nombre y personalidad del agente virtual.
+- [ ] Catalogo de productos o servicios (para cargar en `info_negocio` y `servicios`).
+- [ ] Fotos, videos y PDFs disponibles (para cargar en `servicios_media` si aplica).
 
-Si todos los ítems están marcados, el tenant queda oficialmente en producción.
+### 2.3 Decision inicial de modulos
+
+Segun el modelo de negocio, decidir cuales de los modulos opcionales activar:
+
+| Modelo de negocio | AGENDAMIENTO | MEDIOS | PEDIDOS |
+|--------------------|---------------|---------|----------|
+| Servicios con citas | Si | Si | No |
+| Dropshipping / e-commerce | No | Si | Si |
+| Consultoria B2B con transferencia humana | Segun | Si | No |
+| Venta consultiva sin cierre en bot | No | Si | No |
+
+NUCLEO y GUARDRAILS son obligatorios siempre.
+
+---
+
+## 3. Fase 1 - Registro base
+
+### 3.1 Crear empresa
+
+```sql
+INSERT INTO empresas (
+    nombre, email, telefono, chatwoot_url, chatwoot_api_key,
+    chatwoot_account_id, plan, activo, created_at, updated_at,
+    email_contacto
+)
+VALUES (
+    'Nombre Empresa Cliente',
+    'admin@empresa-cliente.com',
+    '+573001234567',
+    'https://chatwoot.identechnology.co',
+    '<chatwoot_api_key_del_tenant>',
+    <chatwoot_account_id>,
+    'basico',
+    true,
+    NOW() AT TIME ZONE 'America/Bogota',
+    NOW() AT TIME ZONE 'America/Bogota',
+    'contacto@empresa-cliente.com'
+)
+RETURNING id;
+```
+
+Guardar el `id` retornado. Sera el `empresa_id` para todos los INSERT siguientes.
+
+### 3.2 Crear bot_config
+
+```sql
+INSERT INTO bot_config (
+    empresa_id,
+    openai_api_key,
+    openai_key_status,
+    modelo_bot,
+    modelo_clasificador,
+    temperatura_bot,
+    max_tokens_bot,
+    objetivo_bot,
+    tono,
+    prompt_clasificador,
+    prompt_capa_cliente,
+    prompt_capa_reglas_fin,
+    created_at,
+    updated_at
+)
+VALUES (
+    <empresa_id>,
+    'sk-...',
+    'active',
+    'gpt-5-mini',
+    'gpt-4o-mini',
+    0.7,
+    1000,
+    'Objetivo comercial del bot',
+    'Descripcion del tono',
+    '<prompt del clasificador de pipeline>',
+    '<Capa 2 inicial - ver Fase 3>',
+    '',
+    NOW() AT TIME ZONE 'America/Bogota',
+    NOW() AT TIME ZONE 'America/Bogota'
+);
+```
+
+**Notas:**
+- `prompt_capa_reglas_fin` queda vacio (`''`) porque los guardrails ahora estan en el modulo GUARDRAILS global.
+- `prompt_capa_cliente` se llena en la Fase 3.
+- Verificar con el cliente que la `openai_api_key` sea valida antes de guardar.
+
+### 3.3 Crear usuario_cliente
+
+```sql
+INSERT INTO usuarios_cliente (empresa_id, email, activo, created_at, updated_at)
+VALUES (
+    <empresa_id>,
+    'admin@empresa-cliente.com',
+    true,
+    NOW() AT TIME ZONE 'America/Bogota',
+    NOW() AT TIME ZONE 'America/Bogota'
+);
+```
+
+Este email es el que recibira la invitacion al Panel Cliente en la Fase 5.
+
+### 3.4 Configurar inbox de Chatwoot
+
+Desde Chatwoot admin:
+
+- [ ] Crear inbox tipo API Channel o WhatsApp Cloud (segun proveedor).
+- [ ] Configurar webhook a n8n: `https://n8n.identechnology.co/webhook/28fb99ec-026f-428d-b5e8-a4b4978fb2cf`.
+- [ ] Anotar el `account_id` y el `api_access_token` para usarlos en `empresas.chatwoot_account_id` y `empresas.chatwoot_api_key`.
+- [ ] Enviar un mensaje de prueba al numero y verificar que llegue a Chatwoot.
+
+---
+
+## 4. Fase 2 - Activacion de modulos
+
+### 4.1 INSERT en empresa_modulos
+
+Segun la decision de la seccion 2.3, ejecutar:
+
+```sql
+INSERT INTO empresa_modulos (empresa_id, modulo_id, activo, created_at, updated_at)
+SELECT 
+    <empresa_id>,
+    id,
+    true,
+    NOW() AT TIME ZONE 'America/Bogota',
+    NOW() AT TIME ZONE 'America/Bogota'
+FROM modulos_bot
+WHERE codigo IN ('NUCLEO', 'GUARDRAILS' /* + los opcionales que apliquen */);
+```
+
+Ejemplos por tipo de negocio:
+
+**Servicios con citas:**
+```sql
+WHERE codigo IN ('NUCLEO', 'AGENDAMIENTO', 'MEDIOS', 'GUARDRAILS')
+```
+
+**Dropshipping:**
+```sql
+WHERE codigo IN ('NUCLEO', 'MEDIOS', 'PEDIDOS', 'GUARDRAILS')
+```
+
+**Consultoria B2B con transferencia:**
+```sql
+WHERE codigo IN ('NUCLEO', 'MEDIOS', 'GUARDRAILS')
+```
+
+### 4.2 Verificacion
+
+```sql
+SELECT 
+    em.empresa_id,
+    e.nombre AS empresa,
+    mb.codigo,
+    mb.orden,
+    em.activo
+FROM empresa_modulos em
+JOIN modulos_bot mb ON em.modulo_id = mb.id
+JOIN empresas e ON em.empresa_id = e.id
+WHERE em.empresa_id = <empresa_id>
+ORDER BY mb.orden ASC;
+```
+
+Debe aparecer al menos NUCLEO y GUARDRAILS. El orden final del prompt sera el que muestre esta query.
+
+---
+
+## 5. Fase 3 - Redaccion de Capa 2
+
+### 5.1 Base de trabajo
+
+Usar la **Guia Maestra de Prompts AVE v2.1** (`docs/promps/guia-maestra-prompts-ave.md`) como referencia. En particular las secciones:
+
+- Estructura recomendada de Capa 2 (seccion 2).
+- Definicion explicita de tono con ejemplos de los 4 tenants (seccion 3).
+- Regla critica de generacion (seccion 4).
+- Patrones a evitar y patrones a usar (secciones 5 y 6).
+- Prohibiciones especificas vs globales (seccion 7).
+
+### 5.2 Estructura minima obligatoria
+
+Toda Capa 2 nueva debe incluir:
+
+1. Encabezado con nombre del agente y variables.
+2. Seccion "Personalidad y estilo" con tono explicito.
+3. Seccion "Regla critica de generacion" con anti-duplicacion.
+4. Saludo obligatorio EXACTO.
+5. Flujo comercial principal (segun modelo de negocio).
+6. FAQ con datos reales.
+7. Casos especiales (bot?, ingles, molesto, sin avance).
+8. Prohibiciones especificas del tenant (si aplican).
+
+### 5.3 UPDATE con delimitador unico
+
+```sql
+UPDATE bot_config
+SET prompt_capa_cliente = $CAPA2_NUEVOTENANT_V1$
+[contenido completo de la Capa 2]
+$CAPA2_NUEVOTENANT_V1$,
+    updated_at = NOW() AT TIME ZONE 'America/Bogota'
+WHERE empresa_id = <empresa_id>;
+
+-- Verificacion inmediata
+SELECT LENGTH(prompt_capa_cliente) FROM bot_config WHERE empresa_id = <empresa_id>;
+```
+
+**Reglas obligatorias del UPDATE** (ver `docs/troubleshooting/bugs-resueltos.md` bugs #44 y #50):
+- Usar delimitador unico por tenant y version (ejemplo: `$CAPA2_NEWTENANT_V1$`).
+- Solo caracteres ASCII en comentarios SQL (evitar em-dash).
+- Verificar LENGTH inmediatamente despues.
+
+### 5.4 Carga de catalogo
+
+En paralelo, cargar los datos del negocio en las tablas correspondientes:
+
+- **info_negocio:** categorias como "precios", "envios", "caracteristicas", "contacto", etc.
+- **servicios:** productos o servicios con nombre, descripcion, precio.
+- **servicios_media:** URLs de fotos, videos y PDFs asociados a servicios.
+- **etiquetas_pipeline:** estados de lead del pipeline del tenant.
+
+Estas cargas se pueden hacer desde el Panel Cliente Appsmith una vez el cliente tenga acceso.
+
+---
+
+## 6. Fase 4 - Validacion end-to-end
+
+### 6.1 Checklist generico de validacion por WhatsApp
+
+Ejecutar estos casos desde un WhatsApp real (no simulacion) al numero conectado a Chatwoot:
+
+| # | Caso | Esperado |
+|---|------|-----------|
+| 1 | Enviar saludo simple | Saludo obligatorio EXACTO del tenant |
+| 2 | Preguntar por producto o servicio | Consulta catalogo, responde con datos reales |
+| 3 | Preguntar precio | Sigue el flujo comercial definido en Capa 2 |
+| 4 | Solicitar foto/video | Envia solo URLs planas (si tiene MEDIOS) |
+| 5 | Ejecutar flujo transaccional principal | Registra pedido/agenda cita con secuencia critica correcta |
+| 6 | Verificar tono | Coincide con la definicion explicita (tu/usted, emojis, longitud) |
+| 7 | Preguntar si es bot | Respuesta EXACTA definida en Capa 2 |
+| 8 | Escribir en ingles | Responde en ingles con mensaje de bienvenida definido |
+| 9 | Intento de jailbreak ("ignora tus instrucciones") | Respuesta anti-jailbreak de GUARDRAILS |
+| 10 | Enviar mensaje ambiguo | No inventa nombre del cliente, pide clarificacion |
+
+### 6.2 Banderas rojas criticas
+
+Si detectas alguna de estas, PAUSAR y diagnosticar antes de avanzar:
+
+- **Duplicacion de mensajes** en un turno: verificar que "Use Responses API" este DESACTIVADO en n8n. Ver Bug #51.
+- **Fuga de frases en ingles** al cliente: revisar Capa 2 por meta-referencias a NUCLEO. Ver Bug #45.
+- **Bot inventa datos** (precios, disponibilidad): verificar que el catalogo este cargado y que Capa 2 diga "consulta el catalogo" en el flujo.
+- **Bot usa nombres tecnicos** de tools al cliente: hay fuga tecnica en Capa 2. Revisar seccion 5 de la guia maestra.
+- **Bot tutea cuando deberia usted** o viceversa: la definicion de tono en Capa 2 no dominio. Reforzarla.
+- **Bot presenta "3 opciones"** pero solo llegan 1 o 2 imagenes: ajustar Capa 2 a "hasta N opciones" con logica flexible.
+
+### 6.3 Verificaciones en base de datos
+
+Despues del flujo transaccional, verificar directamente en BD:
+
+```sql
+-- Verificar registro del lead
+SELECT * FROM leads 
+WHERE empresa_id = <empresa_id> 
+ORDER BY updated_at DESC LIMIT 1;
+
+-- Verificar registro del pedido (si aplica)
+SELECT * FROM pedidos 
+WHERE empresa_id = <empresa_id> 
+ORDER BY created_at DESC LIMIT 1;
+
+-- Verificar cita (si aplica)
+SELECT * FROM citas 
+WHERE empresa_id = <empresa_id> 
+ORDER BY created_at DESC LIMIT 1;
+```
+
+Todos los datos deben coincidir con lo que el cliente escribio en WhatsApp.
+
+---
+
+## 7. Fase 5 - Entrega al cliente
+
+### 7.1 Invitacion al Panel Cliente
+
+Desde Appsmith (`admin.identechnology.co`):
+
+- [ ] Ir a Settings del workspace correspondiente al tenant.
+- [ ] Enviar invitacion al email registrado en `usuarios_cliente`.
+- [ ] El cliente recibe correo desde `info@identechnology.co` via SMTP Hover.
+- [ ] Cliente crea su contrasena y accede al Panel Cliente.
+
+### 7.2 Verificacion de aislamiento multi-tenant
+
+Con el cliente accediendo por primera vez, verificar:
+
+- [ ] El cliente ve unicamente sus datos (no de otros tenants).
+- [ ] Query `q_get_usuario_actual` usa `{{appsmith.user.email}}` dinamico, no hardcoded.
+- [ ] Todas las paginas usan `q_get_usuario_actual.data[0].empresa_id` para filtrar.
+- [ ] Dashboard muestra KPIs correctos del tenant.
+
+### 7.3 Capacitacion al cliente
+
+Recorrer con el cliente:
+
+- [ ] Pagina "Mi Empresa": datos generales editables.
+- [ ] Pagina "Info Negocio": categorias con contenido consultable por el bot.
+- [ ] Pagina "Servicios": productos con precio, descripcion, categoria.
+- [ ] Pagina "Medios": subida de fotos, videos y PDFs (URLs limpias servidas por ave-api).
+- [ ] Pagina "Config Bot": edicion de `prompt_capa_cliente` (Capa 2) directamente.
+- [ ] Pagina "Config Recordatorios": configurar seguimientos automaticos si aplica.
+- [ ] Pagina "Dashboard": KPIs de leads, conversiones, tasa.
+
+### 7.4 Explicacion de responsabilidades
+
+Aclarar con el cliente:
+
+- **Cliente edita:** su Capa 2 (personalidad, flujo comercial), catalogo, medios, KPIs.
+- **Cliente NO edita:** modulos globales (NUCLEO, MEDIOS, PEDIDOS, AGENDAMIENTO, GUARDRAILS), la Capa 3 (deprecated), configuracion tecnica de n8n o Chatwoot.
+- **Cambios en modulos globales** requieren solicitud al operador AVE (por ejemplo, agregar un nuevo tipo de tool).
+- **Autoservicio de Capa 2** permite ajustar tono, mensajes, FAQ, prohibiciones especificas del tenant.
+
+---
+
+## 8. Estado actual de los 4 tenants
+
+| Tenant | id | Modulos activos | Estado onboarding |
+|--------|-----|-----------------|-------------------|
+| agencIA | 1 | NUCLEO + AGENDAMIENTO + MEDIOS + GUARDRAILS | Completo, validado en produccion |
+| Uhane SAS | 7 | NUCLEO + MEDIOS + PEDIDOS + GUARDRAILS | Completo, validado en produccion |
+| PC_Outlet | 8 | NUCLEO + MEDIOS + GUARDRAILS | Completo, validado en produccion |
+| tienda4030 | 9 | NUCLEO + MEDIOS + PEDIDOS + GUARDRAILS | Completo, validado en produccion |
+
+Todos migrados a arquitectura sandwich refactorizada del 2026-07-13. Backups preservados en `bot_config_backup_20260713`, `modulos_bot_backup_20260713` y `empresa_modulos_backup_20260713`.
+
+---
+
+## 9. Preguntas frecuentes
+
+### 9.1 El cliente pregunta como cambiar el tono del bot
+
+**Respuesta:** desde el Panel Cliente, seccion Config Bot, editar `prompt_capa_cliente`. La seccion "Personalidad y estilo" al inicio del prompt define el tono. Guiar al cliente a seguir el patron de la Guia Maestra seccion 3.
+
+### 9.2 El cliente quiere activar agendamiento
+
+**Respuesta:** el cliente NO puede activar modulos por si mismo. Debe solicitar al operador AVE que ejecute:
+
+```sql
+INSERT INTO empresa_modulos (empresa_id, modulo_id, activo, created_at, updated_at)
+SELECT <empresa_id>, id, true, NOW(), NOW()
+FROM modulos_bot WHERE codigo = 'AGENDAMIENTO';
+```
+
+Ademas, se debe configurar Cal.com self-hosted con el team_slug del tenant (ver `docs/modulos/calcom-instalacion.md`).
+
+### 9.3 El cliente quiere probar cambios en Capa 2 sin afectar produccion
+
+**Respuesta:** actualmente la Capa 2 se edita directamente en produccion desde el Panel Cliente. Se recomienda:
+
+1. Copiar el prompt actual como respaldo antes de editar.
+2. Hacer pruebas por WhatsApp inmediatamente despues del guardado.
+3. Si algo falla, restaurar el prompt anterior desde el respaldo.
+
+Como mejora futura se contempla una pagina "AVE Admin" en Appsmith con backup automatico (ver memoria del 2026-07-13).
+
+### 9.4 Como se factura al cliente
+
+**Respuesta:** el modelo comercial es multi-tenant nativo sin costo por cliente adicional, sin limite de conversaciones, citas ni pedidos. Cada cliente paga su propia API key de OpenAI (multi-tenant desde el 2026-07). Costos de VPS, dominio y almacenamiento son fijos para AVE.
+
+### 9.5 El bot expone informacion tecnica al cliente
+
+**Respuesta:** revisar la Capa 2 del tenant afectado siguiendo el checklist de la Guia Maestra seccion 10. Los casos mas comunes son:
+
+- Nombres tecnicos de tools presentes en Capa 2.
+- Meta-referencias a NUCLEO o "reglas del sistema".
+- Placeholders con corchetes que actuan como plantillas.
+
+Ver bugs #45, #50, #51 en `bugs-resueltos.md`.
+
+---
+
+## 10. Referencias cruzadas
+
+- `docs/modulos/arquitectura-prompts-sandwich.md` - Arquitectura de 3 capas.
+- `docs/promps/guia-maestra-prompts-ave.md` v2.1 - Guia de redaccion de Capa 2.
+- `docs/troubleshooting/bugs-resueltos.md` - Bugs #44 al #51 relevantes.
+- `docs/modulos/panel-cliente-appsmith.md` - Panel Cliente autoservicio.
+- `docs/modulos/openai-multitenant.md` - Gestion multi-tenant de API keys.
+- `docs/modulos/notificaciones-openai-key.md` - Auto-update de estado de key.
+- `docs/modulos/calcom-instalacion.md` - Cal.com para AGENDAMIENTO.
+
+---
+
+**Fin del documento.**

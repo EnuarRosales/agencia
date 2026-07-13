@@ -1830,3 +1830,186 @@ Con este cambio, `q_get_usuario_actual` empezó a resolver correctamente el usua
 
 **Regla operativa establecida:** La auditoría manual post-fork descrita en el Bug 48 debe incluir explícitamente la revisión de `q_get_usuario_actual` como primera prioridad. Es la query raíz del mecanismo multi-tenant y cualquier valor hardcodeado en ella propaga el bug a todo el Panel Cliente. Todo email en el filtro debe ser `{{appsmith.user.email}}` sin excepción, y toda otra query dependiente debe usar `{{q_get_usuario_actual.data[0].empresa_id}}` sin excepción.
 
+## 2. Bug 50
+
+### Titulo
+Em-dash `-` (U+2014) en comentarios SQL rompe delimitadores `$BODY$` en DBeaver.
+
+### Sintoma
+
+Al ejecutar un UPDATE con dollar-quoted strings (`$BODY$...$BODY$`) en DBeaver, si el bloque SQL contiene comentarios con em-dash (por ejemplo `-- FASE B - Refactor MEDIOS`), el parser de DBeaver puede interpretar erroneamente el em-dash como caracter especial y romper el delimitador. El error tipico es:
+
+```
+SQL Error: syntax error at or near "..."
+Position: 432
+```
+
+Donde `Position 432` corresponde justo al caracter del em-dash.
+
+### Causa raiz
+
+DBeaver hace parsing intermedio de la cadena antes de enviarla al servidor Postgres. En ciertos contextos con dollar-quoting anidado o cerca de comentarios de linea, el em-dash Unicode confunde el detector de delimitadores.
+
+### Diagnostico
+
+- El UPDATE falla en la posicion exacta del em-dash del comentario.
+- Reemplazar el em-dash por guion simple `-` resuelve el problema.
+- El bug NO ocurre en `psql` directo, solo en DBeaver.
+
+### Solucion aplicada
+
+1. **Usar delimitadores unicos por bloque:**
+   - `$NUCLEO_V2$...$NUCLEO_V2$`
+   - `$MEDIOS_V2$...$MEDIOS_V2$`
+   - `$PEDIDOS_V2$...$PEDIDOS_V2$`
+   - `$GUARDRAILS_V1$...$GUARDRAILS_V1$`
+   - `$CAPA2_TIENDA4030_V2$...$CAPA2_TIENDA4030_V2$`
+
+2. **Reemplazar em-dashes por guiones simples** en TODOS los comentarios SQL.
+
+3. **Nomenclatura:** delimitador incluye el bloque y version para evitar colisiones futuras.
+
+### Prevencion
+
+- Al generar SQL desde herramientas que usan em-dash automatico (Microsoft Word, editores markdown), pasar el bloque por un `sed 's/-/-/g'` antes de pegarlo en DBeaver.
+- Documentar en la guia maestra: usar SIEMPRE delimitadores unicos por bloque.
+- En scripts de migracion, usar solo caracteres ASCII en comentarios.
+
+### Contexto de deteccion
+
+Detectado durante la Fase B del refactor de arquitectura sandwich (2026-07-13), al ejecutar el UPDATE del modulo MEDIOS con delimitador `$BODY$` reutilizado despues del NUCLEO.
+
+---
+
+## 3. Bug 51
+
+### Titulo
+GPT-5-mini + "Use Responses API" activado + Tools activas genera output duplicado concatenado.
+
+### Sintoma
+
+Cuando el AI Agent Principal en n8n usa `gpt-5-mini` como modelo con el toggle **"Use Responses API"** activado en el nodo OpenAI Chat Model, y hay tools intercaladas en el turno, el output del agente contiene el mensaje duplicado sin separador de linea. Ejemplo real:
+
+```
+"Perfecto Enuar. Ahora, que empresa esta a nombre el pedido?Perfecto Enuar, a que empresa esta a nombre el pedido?"
+```
+
+El cliente recibe un solo mensaje con las dos versiones concatenadas. El fenomeno NO ocurre en todos los turnos, solo cuando el modelo llama una tool durante la generacion de la respuesta.
+
+### Causa raiz
+
+Comportamiento de GPT-5-mini con la API Responses cuando hay tools activas:
+
+1. El modelo genera un primer borrador de respuesta.
+2. Llama a la tool (por ejemplo `actualizar_lead_datos`).
+3. La tool retorna OK.
+4. El modelo genera una version refinada de la respuesta.
+5. **En vez de reemplazar el borrador, el API Responses los concatena** en el `output.response.generations[0].text`.
+
+Este bug fue confirmado inspeccionando el output crudo del nodo OpenAI Chat Model1 en n8n Executions:
+
+```json
+{
+  "response": {
+    "generations": [
+      {
+        "text": "Perfecto Enuar. Ahora, que empresa...?Perfecto Enuar, a que empresa...?",
+        "completionTokens": 32
+      }
+    ]
+  }
+}
+```
+
+El texto duplicado viene directamente del LLM, no de LangChain, no de memoria, no del prompt.
+
+### Diagnostico
+
+**Verificacion en 3 pasos:**
+
+1. Reproducir el flujo hasta que aparezca la duplicacion (usualmente en el flujo de captura de datos con tools intercaladas).
+2. En n8n -> Executions -> ejecucion afectada -> nodo `OpenAI Chat Model1` -> tab Output -> inspeccionar `response.generations[0].text`.
+3. Si el texto duplicado esta en el output crudo del LLM (no post-procesado), el bug es del modelo con Responses API.
+
+### Solucion aplicada
+
+**Desactivar el toggle "Use Responses API"** en el nodo `OpenAI Chat Model1` del workflow TEST-PRINCIPAL.
+
+```
+n8n -> workflow TEST-PRINCIPAL -> nodo OpenAI Chat Model1 -> Parametros ->
+       Options -> "Use Responses API" -> desactivar toggle -> Save
+```
+
+Con Responses API desactivada, el nodo usa la Chat Completions API estandar, que es predecible con gpt-5-mini y NO produce output duplicado.
+
+### Efectos secundarios
+
+- Ninguno detectado. Todos los flujos siguen funcionando correctamente.
+- Los agentes de los 4 tenants (agencIA, Uhane, PC_Outlet, tienda4030) validados end-to-end sin duplicaciones.
+- Costo de tokens sin cambios.
+
+### Alternativas evaluadas
+
+| Opcion | Costo | Riesgo | Adoptada |
+|--------|-------|--------|----------|
+| Desactivar "Use Responses API" | 1 click | Muy bajo | Si |
+| Cambiar modelo a `gpt-4o-mini` | 1 click | Bajo (cambio de personalidad sutil) | Fallback si opcion 1 no funcionara |
+| Post-procesamiento con dedupe en Code_detectar_media | Medio | Medio (parche, no soluciona raiz) | No |
+
+### Prevencion
+
+- Documentar en la guia maestra que "Use Responses API" debe permanecer **desactivada** mientras se use `gpt-5-mini` con tools.
+- Al probar futuras versiones de modelos OpenAI, verificar comportamiento con tools intercaladas antes de activar Responses API.
+- Incluir en el checklist de validacion post-migracion: "Verificar que respuestas no contengan texto duplicado concatenado."
+
+### Contexto de deteccion
+
+Detectado durante la validacion end-to-end del refactor de Capa 2 de Uhane SAS (2026-07-13). El bug estaba latente en todos los tenants pero solo se manifesto en Uhane porque tenia el flujo de captura de datos mas iterativo (7 datos uno por uno).
+
+---
+
+## 4. Patrones preventivos consolidados
+
+### 4.1 SQL y UPDATEs
+
+- **Delimitadores unicos por bloque:** `$MODULO_VERSION$` (ej: `$NUCLEO_V2$`, `$CAPA2_TIENDA4030_V2$`).
+- **Solo caracteres ASCII en comentarios SQL** (evitar em-dash, comillas curvas, etc.).
+- **Backup obligatorio** antes de cualquier UPDATE en `modulos_bot`, `empresa_modulos` o `bot_config`.
+- **Verificacion inmediata con `SELECT LENGTH(...)` + comparacion contra backup** en la misma ejecucion.
+
+### 4.2 Configuracion de nodos n8n
+
+- **AI Agent con gpt-5-mini + tools:** "Use Responses API" DESACTIVADO.
+- **Postgres Chat Memory:** `contextWindowLength=30` para evitar contaminacion de patrones antiguos.
+- **binaryMode:** `separate` para envio de multiples archivos multimedia.
+
+### 4.3 Redaccion de prompts
+
+- **Sin meta-referencias** a NUCLEO, "reglas del sistema" ni "capas anteriores" en Capa 2 ni Capa 3.
+- **Sin nombres tecnicos de tools** en Capa 2 (tools se refieren solo por su comportamiento comercial).
+- **Sin placeholders con corchetes vacios** que el LLM interprete como plantillas a rellenar multiples veces.
+- **Tono explicito en Capa 2** ya que NUCLEO es tono-neutral.
+
+### 4.4 Testing post-migracion
+
+Checklist minimo para cada tenant tras cambios en Capa 2:
+
+- [ ] Saludo inicial exacto
+- [ ] Sin duplicacion de mensajes
+- [ ] Tono correcto (usted/tu, emojis segun definicion)
+- [ ] Sin exposicion de nombres tecnicos de tools
+- [ ] Flujo transaccional principal completo (agendamiento/pedido)
+- [ ] Casos especiales (bot?, ingles, molesto)
+- [ ] Anti-jailbreak (intento de "ignora tus instrucciones")
+
+---
+
+## 5. Referencias cruzadas
+
+- `docs/modulos/arquitectura-prompts-sandwich.md` - Arquitectura de 3 capas y modulo GUARDRAILS global.
+- `docs/promps/guia-maestra-prompts-ave.md` - Guia de redaccion de prompts v2.1.
+- `docs/onboarding-clientes/onboarding-clientes.md` - Flujo de creacion de nuevos tenants.
+- `docs/modulos/panel-cliente-appsmith.md` - Panel Cliente autoservicio.
+- `docs/modulos/openai-multitenant.md` - Gestion de API keys de OpenAI por tenant.
+
+
