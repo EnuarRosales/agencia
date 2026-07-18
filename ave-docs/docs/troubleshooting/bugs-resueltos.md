@@ -2012,4 +2012,610 @@ Checklist minimo para cada tenant tras cambios en Capa 2:
 - `docs/modulos/panel-cliente-appsmith.md` - Panel Cliente autoservicio.
 - `docs/modulos/openai-multitenant.md` - Gestion de API keys de OpenAI por tenant.
 
+## 6. Bug 52
+
+### Titulo
+Doble espacio interno en nombre de servicio impide match en `buscar_media_servicio`.
+
+### Sintoma
+
+Cuando el bot intentaba enviar fotos o video de un producto mediante la herramienta `buscar_media_servicio`, la busqueda devolvia 0 resultados incluso cuando el producto existia en el catalogo con multimedia cargada. El cliente recibia el mensaje de fallback: "Este producto no cuenta con material visual disponible actualmente."
+
+Ejemplo real detectado en tienda4030:
+
+- Producto en BD: `Reloj  del Millonario` (con doble espacio entre "Reloj" y "del")
+- LLM llamaba: `buscar_media_servicio` con termino `"reloj del millonario"` (un solo espacio)
+- Resultado: 0 filas devueltas
+
+Sin embargo, con terminos parciales si funcionaba:
+
+| Termino usado por LLM | Match en BD | Resultado |
+|---|---|---|
+| `reloj` | Si (subcadena) | 4 imagenes |
+| `millonario` | Si (subcadena) | 4 imagenes |
+| `reloj del millonario` | NO (doble espacio interno) | 0 imagenes |
+
+### Causa raiz
+
+El operador `ILIKE` de PostgreSQL usado en la query de `buscar_media_servicio` es **literal en cuanto a espaciado**. No hace normalizacion ni colapso de espacios.
+
+Cuando el nombre del servicio se guardo en la BD con doble espacio (probablemente por un typo del cliente al escribir en el input del Panel Cliente Appsmith), y luego el LLM buscaba con espaciado normal, el ILIKE fallaba silenciosamente.
+
+Este bug es especialmente peligroso porque:
+
+- Los terminos simples (`reloj`, `millonario`) si funcionaban, dando falsa sensacion de que el sistema estaba bien
+- Solo fallaba cuando el LLM usaba el nombre completo del producto (comportamiento comercial deseado)
+- El fallback del modulo MEDIOS ocultaba el error real
+
+### Diagnostico
+
+**Paso 1:** Confirmar que el servicio y sus medios existen y estan activos.
+
+```sql
+SELECT s.id, s.nombre, s.activo,
+       COUNT(sm.id) AS total_medios,
+       COUNT(sm.id) FILTER (WHERE sm.activo = true) AS medios_activos
+FROM servicios s
+LEFT JOIN servicios_media sm ON sm.servicio_id = s.id
+WHERE s.empresa_id = 9
+GROUP BY s.id, s.nombre, s.activo
+ORDER BY s.id;
+```
+
+**Paso 2:** Simular la query de `buscar_media_servicio` con distintos terminos.
+
+```sql
+SELECT 'reloj del millonario' AS termino, COUNT(*) AS encontrados
+FROM servicios s JOIN servicios_media sm ON sm.servicio_id = s.id
+WHERE s.empresa_id = 9 AND s.activo = true AND sm.activo = true
+  AND LOWER(s.nombre) ILIKE '%reloj del millonario%';
+```
+
+Si el termino generico encuentra pero el compuesto no, sospechar de espaciado o caracteres invisibles.
+
+**Paso 3:** Inspeccionar el LENGTH del nombre real.
+
+```sql
+SELECT id, nombre, LENGTH(nombre) AS chars
+FROM servicios
+WHERE id = 51;
+```
+
+El LENGTH mostro 21 caracteres cuando el nombre visualmente correcto tiene 20. Ese caracter de mas es el espacio duplicado.
+
+### Solucion aplicada
+
+**Fix inmediato:** UPDATE del nombre en BD con espacio unico.
+
+```sql
+BEGIN;
+
+UPDATE servicios
+SET nombre = 'Reloj del Millonario',
+    updated_at = NOW() AT TIME ZONE 'America/Bogota'
+WHERE id = 51
+  AND empresa_id = 9;
+
+-- Verificacion
+SELECT id, nombre, LENGTH(nombre) FROM servicios WHERE id = 51;
+-- Debe salir: 20 chars
+
+COMMIT;
+```
+
+**Fix defensivo (candidato futuro para el Panel Cliente Appsmith):** normalizar el input al guardar servicios.
+
+```sql
+-- Al insertar o actualizar servicios, colapsar espacios internos
+UPDATE servicios
+SET nombre = REGEXP_REPLACE(TRIM(nombre), '\s+', ' ', 'g')
+WHERE nombre != REGEXP_REPLACE(TRIM(nombre), '\s+', ' ', 'g');
+```
+
+**Fix arquitectonico (candidato futuro):** modificar la query de `buscar_media_servicio` para ser tolerante a espaciado.
+
+```sql
+-- Antes:
+AND LOWER(s.nombre) ILIKE '%' || :termino || '%'
+
+-- Despues:
+AND LOWER(REGEXP_REPLACE(s.nombre, '\s+', ' ', 'g')) ILIKE '%' || REGEXP_REPLACE(LOWER(:termino), '\s+', ' ', 'g') || '%'
+```
+
+### Efectos secundarios
+
+- Ninguno detectado tras el UPDATE del nombre en tienda4030
+- Todos los productos con multimedia siguen respondiendo correctamente
+- No hay impacto en otros tenants
+
+### Prevencion
+
+- **Auditoria periodica** con la query de deteccion:
+
+```sql
+SELECT id, empresa_id, nombre, LENGTH(nombre) AS chars,
+       LENGTH(REGEXP_REPLACE(nombre, '\s+', ' ', 'g')) AS chars_normalizado
+FROM servicios
+WHERE activo = true
+  AND LENGTH(nombre) != LENGTH(REGEXP_REPLACE(nombre, '\s+', ' ', 'g'));
+```
+
+- **Al hacer onboarding de nuevos tenants**, incluir validacion de nombres de servicios en el checklist
+- **Considerar** agregar normalizacion automatica en el Panel Cliente Appsmith al guardar servicios
+
+### Contexto de deteccion
+
+Detectado durante la implementacion del sistema `[[SPLIT]]` con multimedia en tienda4030 (2026-07-16). El cliente reporto que "las fotos del reloj no llegan" durante una demo. El diagnostico inicial fallo porque los terminos simples si encontraban resultados. Solo al probar con el nombre completo del producto se identifico el patron.
+
+---
+
+## 7. Bug 53
+
+### Titulo
+Placeholder de URLs multimedia en Capa 2 es interpretado como texto literal por el LLM.
+
+### Sintoma
+
+Durante el flujo comercial de tienda4030, cuando el LLM debia enviar fotos del producto en su respuesta, en lugar de llamar `buscar_media_servicio` y colocar las URLs reales, copiaba textualmente el placeholder del prompt:
+
+Prompt tenia:
+
+```
+"Formato exacto del mensaje:
+
+Que gusto atenderte, soy Jhoana
+[[SPLIT:2500]]
+[urls de fotos y video de la Resina, cada una en su propia linea, SIN texto]
+[[SPLIT:2000]]
+Beneficios..."
+```
+
+Output real del LLM (segmento 3):
+
+```
+"[urls de fotos y video de la Resina, cada una en su propia linea, SIN texto]"
+```
+
+El LLM enviaba el placeholder como texto plano al cliente, en lugar de reemplazarlo con las URLs reales de la tool.
+
+### Causa raiz
+
+Este bug es una variante del principio arquitectonico ya conocido: **el LLM copia ejemplos textuales del prompt literalmente**.
+
+Cuando el prompt contiene:
+
+- Instruccion abstracta: "Llama buscar_media_servicio para obtener las URLs"
+- Placeholder textual: `[urls de fotos y video de la Resina, cada una en su propia linea, SIN texto]`
+
+El LLM tiende a copiar el placeholder textual y omitir la instruccion abstracta, especialmente si el placeholder esta bien delimitado con corchetes (los LLMs los tratan como "contenido a preservar").
+
+Sin refuerzo imperativo, el placeholder se convierte en el output literal.
+
+### Diagnostico
+
+**Paso 1:** Revisar el output crudo del nodo `AI_Agent_Principal` en n8n Executions.
+
+Buscar si el segmento contiene texto entre corchetes que coincide con el placeholder del prompt.
+
+**Paso 2:** Confirmar que la herramienta `buscar_media_servicio` NO se llamo durante ese turno.
+
+En n8n Executions, verificar que en el nodo `buscar_media_servicio` NO aparece ejecucion para ese turno especifico.
+
+**Paso 3:** Verificar que el prompt contiene el placeholder problematico.
+
+```sql
+SELECT SUBSTRING(prompt_capa_cliente,
+                 POSITION('[urls de fotos y video' IN prompt_capa_cliente),
+                 200) AS contexto_placeholder
+FROM bot_config
+WHERE empresa_id = 9;
+```
+
+### Solucion aplicada
+
+**Solucion 1:** Reforzar en Capa 2 con instruccion imperativa explicita.
+
+Antes:
+
+```
+[urls de fotos y video de la Resina, cada una en su propia linea, SIN texto]
+```
+
+Despues:
+
+```
+CRITICO ABSOLUTO: para obtener las URLs de fotos y video de la Resina, DEBES OBLIGATORIAMENTE llamar a la herramienta buscar_media_servicio con el termino "resina" o "dental" ANTES de generar tu respuesta.
+
+Reemplaza el siguiente placeholder con las URLs REALES devueltas por la tool (cada URL en su propia linea):
+
+[Aqui las URLs devueltas por buscar_media_servicio]
+
+NUNCA copies este placeholder textual. NUNCA inventes URLs. Las URLs solo se obtienen llamando buscar_media_servicio.
+```
+
+**Solucion 2:** Refactorizar el modulo MEDIOS global.
+
+Reemplazar ejemplos con URLs literales por placeholders explicitos delimitados:
+
+```sql
+UPDATE modulos_bot
+SET prompt_bloque = REPLACE(
+    prompt_bloque,
+    'Cliente pide fotos:
+"Con gusto, aqui tiene las imagenes:
+https://api.identechnology.co/ave/media/1/imagenes/archivo1.jpg
+https://api.identechnology.co/ave/media/1/imagenes/archivo2.jpg"',
+    'Cliente pide fotos:
+"Con gusto, aqui tiene las imagenes:
+[URLs exactas devueltas por buscar_media_servicio, cada una en su propia linea]"
+
+CRITICO: NUNCA inventes URLs ni las copies de estos ejemplos. Las URLs entre corchetes son SOLO placeholders. SIEMPRE llama buscar_media_servicio para obtener las URLs reales del catalogo del tenant activo.'
+)
+WHERE codigo = 'MEDIOS';
+```
+
+### Efectos secundarios
+
+- Ninguno detectado
+- Los otros tenants (agencIA, Uhane, PC_Outlet) se beneficiaron del refactor del modulo MEDIOS
+- Reduccion de riesgo de alucinacion de URLs en flujos multimedia futuros
+
+### Prevencion
+
+- **Regla arquitectonica formalizada:** los ejemplos del prompt NO deben contener URLs literales que puedan confundirse con datos reales
+- **Usar placeholders explicitos** entre corchetes con leyenda descriptiva: `[valor devuelto por tool X]`
+- **Cuando se requiera flujo comercial critico** (como envio inicial de multimedia), reforzar en Capa 2 del tenant con instruccion imperativa
+- **Checklist post-refactor:** verificar que ningun placeholder aparezca literal en outputs del LLM
+
+### Contexto de deteccion
+
+Detectado durante la implementacion del sistema `[[SPLIT]]` con multimedia en tienda4030 (2026-07-16). Aparecio junto con el Bug #54 (URLs alucinadas) como sintomas relacionados del mismo problema arquitectonico: los ejemplos del prompt controlan el comportamiento del LLM mas que las reglas abstractas.
+
+---
+
+## 8. Bug 54
+
+### Titulo
+LLM alucina URLs de multimedia con `empresa_id` incorrecto copiando ejemplos literales del prompt.
+
+### Sintoma
+
+Cuando el LLM debia enviar fotos y video de un producto de tienda4030 (empresa_id=9), en su output aparecian URLs con estructura correcta pero **empresa_id equivocado**:
+
+```
+Output erroneo:
+https://api.identechnology.co/ave/media/1/imagenes/resina1.jpg
+https://api.identechnology.co/ave/media/1/imagenes/resina2.jpg
+https://api.identechnology.co/ave/media/1/videos/resina.mp4
+```
+
+Las URLs correctas para tienda4030 deberian tener `/media/9/`:
+
+```
+URLs correctas del catalogo:
+https://api.identechnology.co/ave/media/9/imagenes/47_1782672416589.jpeg
+https://api.identechnology.co/ave/media/9/imagenes/47_1782672439324.jpeg
+https://api.identechnology.co/ave/media/9/videos/47_1782672617362.mp4
+```
+
+Las URLs con `/media/1/` no existian en el servidor. El cliente veia "no hay fotos disponibles" o archivos rotos al hacer click.
+
+### Causa raiz
+
+**El LLM copia ejemplos textuales del prompt LITERALMENTE.**
+
+En el modulo MEDIOS global, los ejemplos usaban URLs literales con `empresa_id=1`:
+
+```
+Ejemplo (modulo MEDIOS):
+
+Cliente pide fotos:
+"Con gusto, aqui tiene las imagenes:
+https://api.identechnology.co/ave/media/1/imagenes/archivo1.jpg
+https://api.identechnology.co/ave/media/1/imagenes/archivo2.jpg"
+```
+
+En lugar de invocar `buscar_media_servicio` para obtener las URLs reales del catalogo del tenant activo, el LLM copiaba las URLs del ejemplo textualmente con `/media/1/`. Sin embargo, tienda4030 tiene `empresa_id=9`, por lo que esas URLs no existen en su catalogo.
+
+Este comportamiento reconfirma el principio arquitectonico ya observado en Bug #45 y Bug #53:
+
+- Los LLMs prefieren copiar ejemplos textuales
+- Ignoran o interpretan como opcional las reglas abstractas
+- Especialmente peligroso cuando los ejemplos contienen valores literales
+
+### Diagnostico
+
+**Paso 1:** Confirmar que las URLs reales existen en BD para el tenant.
+
+```sql
+SELECT sm.id, s.nombre, sm.tipo, sm.url
+FROM servicios_media sm
+JOIN servicios s ON s.id = sm.servicio_id
+WHERE s.empresa_id = 9
+  AND sm.activo = true;
+```
+
+Resultado: 3 URLs correctas con `/media/9/`. Descartado que la BD tenga datos erroneos.
+
+**Paso 2:** Revisar el output crudo del LLM en `Code_detectar_media`.
+
+Se confirmo que el LLM devolvia las URLs alucinadas con `/media/1/`, sin haber llamado la tool `buscar_media_servicio` (o llamandola pero ignorando su resultado).
+
+**Paso 3:** Revisar el prompt del modulo MEDIOS.
+
+En el bloque de instrucciones del modulo MEDIOS aparecian ejemplos con URLs literales que el LLM copiaba tal cual.
+
+### Solucion aplicada
+
+**Solucion 1:** Refactorizar el modulo MEDIOS global reemplazando URLs literales por placeholders.
+
+```sql
+UPDATE modulos_bot
+SET prompt_bloque = REPLACE(
+    prompt_bloque,
+    'Cliente pide fotos:
+"Con gusto, aqui tiene las imagenes:
+https://api.identechnology.co/ave/media/1/imagenes/archivo1.jpg
+https://api.identechnology.co/ave/media/1/imagenes/archivo2.jpg"',
+    'Cliente pide fotos:
+"Con gusto, aqui tiene las imagenes:
+[URLs exactas devueltas por buscar_media_servicio, cada una en su propia linea]"
+
+CRITICO: NUNCA inventes URLs ni las copies de estos ejemplos. Las URLs entre corchetes son SOLO placeholders. SIEMPRE llama buscar_media_servicio para obtener las URLs reales del catalogo del tenant activo.'
+)
+WHERE codigo = 'MEDIOS';
+```
+
+**Solucion 2:** Reforzar en Capa 2 del tenant con instruccion imperativa especifica.
+
+```
+CRITICO ABSOLUTO: para obtener las URLs de fotos y videos, DEBES OBLIGATORIAMENTE llamar a la herramienta buscar_media_servicio con el termino del producto ("resina" o "reloj"). NUNCA inventes URLs ni las copies de ejemplos que veas en las reglas.
+
+Recordatorio: las URLs con /media/1/ que aparecen en la documentacion de modulos son SOLO EJEMPLOS. Las URLs reales de este tenant tienen /media/9/. Si copias URLs con /media/1/ estas alucinando y el cliente vera archivos rotos.
+```
+
+### Efectos secundarios
+
+- **Positivo:** todos los tenants con multimedia (agencIA, Uhane, PC_Outlet, tienda4030) se beneficiaron del refactor del modulo MEDIOS
+- **Neutro:** el prompt de MEDIOS crecio ~200 chars (impacto negligible en tokens)
+- **Sin regresiones detectadas** en los flujos existentes
+
+### Prevencion
+
+- **Regla arquitectonica formalizada:** los ejemplos del prompt NO deben contener valores literales que puedan confundirse con datos reales
+- **Usar placeholders explicitos**: `[URL devuelta por tool X]`, `[nombre del cliente]`, `[fecha calculada]`
+- **Auditoria periodica del modulo MEDIOS** con la query:
+
+```sql
+SELECT prompt_bloque
+FROM modulos_bot
+WHERE codigo = 'MEDIOS'
+  AND prompt_bloque LIKE '%https://api.identechnology.co/ave/media/%';
+```
+
+Si aparece contenido, hay riesgo latente de alucinacion.
+
+- **Verificacion post-envio de multimedia** en logs:
+
+```sql
+SELECT servicio_nombre, url, empresa_id
+FROM media_enviado_log
+WHERE created_at > NOW() - INTERVAL '1 hour'
+  AND url NOT LIKE '%/media/' || empresa_id || '/%';
+```
+
+Cualquier fila con URLs inconsistentes es signo de alucinacion.
+
+### Contexto de deteccion
+
+Detectado durante la implementacion del sistema `[[SPLIT]]` con multimedia en tienda4030 (2026-07-16). Aparecio simultaneamente con Bug #53 (placeholder literal) como manifestaciones del mismo problema arquitectonico. La solucion tuvo impacto positivo transversal en los 4 tenants aunque solo se manifesto en tienda4030 durante la implementacion.
+
+---
+
+## 9. Bug 55
+
+### Titulo
+Line endings de Windows (`\r\n`) rompen la deteccion del marcador `[[SPLIT:xxxx]]` con delays personalizados.
+
+### Sintoma
+
+El marcador `[[SPLIT:3000]]` funcionaba correctamente cuando estaba pegado inline al texto anterior con caracteres residuales:
+
+```
+"...del dia de hoy.14[[SPLIT:3000]]a
+[urls de fotos]..."
+```
+
+Pero fallaba (era ignorado como marcador) cuando estaba en formato limpio con salto de linea:
+
+```
+"...del dia de hoy.
+[[SPLIT:3000]]
+[urls de fotos]..."
+```
+
+En este segundo formato, el sistema no reconocia el marcador y todo el texto se enviaba como una sola burbuja, ignorando tanto la instruccion de division como el delay personalizado de 3000ms.
+
+Los operadores AVE descubrian el bug "por accidente" agregando caracteres extras al lado del marcador, sin entender la causa real. Esto llevaba a prompts sucios con truquitos que el cliente podria borrar accidentalmente desde el Panel Cliente Appsmith.
+
+### Causa raiz
+
+El texto que llegaba a n8n desde el LLM (o desde Chatwoot en algunos flujos) tenia line endings de Windows (`\r\n`) en lugar de Unix (`\n`).
+
+Sin normalizacion, el regex de deteccion:
+
+```javascript
+const SPLIT_REGEX = /\[\[SPLIT(?::(\w+))?\]\]/g;
+```
+
+Tenia comportamiento inconsistente al capturar el grupo del delay (`:xxxx`) cuando `\r` se colaba en el fragmento circundante.
+
+En el caso "inline" (`14[[SPLIT:3000]]a`), no habia `\r` cerca del marcador, por lo que el regex funcionaba. En el caso "limpio" (con saltos de linea), el `\r` residual interferia con el matching del grupo capturado.
+
+### Diagnostico
+
+**Paso 1:** Agregar un `console.log` temporal al inicio de `Code_detectar_media`.
+
+```javascript
+console.log('Output crudo:', JSON.stringify($input.item.json.output));
+```
+
+Al inspeccionar la consola de n8n, se detecto que el texto llegaba con `\r\n`:
+
+```javascript
+// Salida del console.log:
+"del dia de hoy.\r\n[[SPLIT:3000]]\r\n[URLs]"
+```
+
+**Paso 2:** Probar normalizacion temporal en un fork del nodo.
+
+```javascript
+output = output.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+```
+
+Con esta normalizacion, el marcador se detectaba consistentemente en cualquier formato.
+
+**Paso 3:** Confirmar retrocompatibilidad.
+
+Los formatos que ya funcionaban (inline con caracteres extras) siguieron funcionando tras la normalizacion. Los formatos que fallaban (con saltos de linea) empezaron a funcionar correctamente.
+
+### Solucion aplicada
+
+**Fix definitivo:** Agregar normalizacion al inicio de `Code_detectar_media`.
+
+```javascript
+// Code_detectar_media v3.0
+
+let output = $input.item.json.output || '';
+
+// Normalizar line endings (Windows -> Unix) - Fix Bug #55
+output = output.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+// Resto del procesamiento...
+```
+
+Con esta linea al inicio, el sistema es robusto ante line endings de cualquier plataforma.
+
+### Efectos secundarios
+
+- **Ninguno negativo detectado**
+- **Positivo:** los prompts pueden usar formato limpio con saltos de linea, mejorando legibilidad
+- **Positivo:** los operadores AVE ya no necesitan truquitos con caracteres extras
+- **Positivo:** los clientes pueden editar la Capa 2 sin miedo de romper el sistema borrando caracteres criticos
+
+### Alternativas evaluadas
+
+| Opcion | Costo | Riesgo | Adoptada |
+|---|---|---|---|
+| Normalizar `\r\n → \n` en `Code_detectar_media` | 1 linea | Muy bajo | Si |
+| Modificar regex para tolerar `\r` opcional | Complejidad regex | Medio | No |
+| Normalizar en el prompt manualmente | Alto (por tenant) | Alto (usuario debe recordarlo) | No |
+| Sanitizar output del LLM en un nodo separado | Nodo adicional | Bajo | No (solucion 1 es suficiente) |
+
+### Prevencion
+
+- **Regla arquitectonica:** siempre normalizar input antes de procesarlo con regex, especialmente cuando el input viene de fuentes externas (LLMs, APIs, uploads)
+- **Auditoria de prompts** con query defensiva para detectar `\r` residuales en BD:
+
+```sql
+SELECT empresa_id,
+       LENGTH(prompt_capa_cliente) AS chars,
+       (LENGTH(prompt_capa_cliente) - LENGTH(REPLACE(prompt_capa_cliente, E'\r\n', E'\n'))) AS carriage_returns_en_bd
+FROM bot_config
+WHERE prompt_capa_cliente LIKE '%' || E'\r' || '%';
+```
+
+- **Documentar el patron** en la guia maestra: "line endings de Windows son un enemigo silencioso"
+- **Aplicar el mismo fix defensivo** a cualquier nodo Code futuro que procese texto con regex
+
+### Contexto de deteccion
+
+Detectado durante la implementacion del sistema `[[SPLIT:xxxx]]` con delays dinamicos en tienda4030 (2026-07-16 al 2026-07-18). Inicialmente los operadores AVE encontraron el "truco" de agregar caracteres extras al lado del marcador para hacerlo funcionar, sin entender la causa. Al investigar por que el truco funcionaba y el formato limpio no, se descubrio el bug de line endings.
+
+Es un ejemplo perfecto del anti-patron **"cuando algo funciona solo con un truco raro, investigar la causa subyacente en lugar de dejar el truco"**.
+
+---
+
+## 10. Patrones preventivos consolidados (actualizado 2026-07-18)
+
+### 10.1 SQL y UPDATEs
+
+- **Delimitadores unicos por bloque:** `$MODULO_VERSION$` (ej: `$NUCLEO_V3$`, `$CAPA2_TIENDA4030_V6$`)
+- **Solo caracteres ASCII en comentarios SQL** (evitar em-dash, comillas curvas)
+- **Backup obligatorio** antes de cualquier UPDATE en `modulos_bot`, `empresa_modulos`, `bot_config`, `servicios`
+- **Verificacion inmediata con `SELECT LENGTH(...) + POSITION(...)`** en la misma ejecucion
+- **En caso de error de transaccion abortada:** ejecutar `ROLLBACK;` en una pestaña nueva y reintentar
+
+### 10.2 Configuracion de nodos n8n
+
+- **AI Agent con gpt-5-mini + tools:** "Use Responses API" DESACTIVADO (Bug #51)
+- **AI Agent con gpt-4o-mini:** recomendado para casos con delays personalizados y `[[SPLIT]]`
+- **Postgres Chat Memory:** `contextWindowLength=30` (o menor si el prompt es muy grande)
+- **binaryMode:** `separate` para envio de multiples archivos multimedia
+- **Nodos Code que procesan output de LLM:** aplicar normalizacion `\r\n → \n` al inicio (Bug #55)
+- **Nodos Code en modo `Run Once for All Items`** cuando usen `$input.first()` o `$('otro_nodo').first()`
+
+### 10.3 Redaccion de prompts
+
+- **Sin meta-referencias** a NUCLEO, "reglas del sistema" ni "capas anteriores" en Capa 2 ni Capa 3
+- **Sin nombres tecnicos de tools** en Capa 2 (referirse por comportamiento comercial)
+- **Sin placeholders con corchetes vacios** que el LLM interprete como plantillas a rellenar multiples veces
+- **Sin URLs literales en ejemplos** que el LLM pueda copiar textualmente (Bug #54)
+- **Con placeholders explicitos** entre corchetes con leyenda: `[URL devuelta por tool X]` (Bug #53)
+- **Tono explicito en Capa 2** ya que NUCLEO es tono-neutral
+- **Refuerzo imperativo** cuando el LLM tiende a ignorar reglas abstractas: "DEBES OBLIGATORIAMENTE llamar a X ANTES de responder"
+
+### 10.4 Sistema `[[SPLIT]]` con delays dinamicos
+
+- **Sintaxis:** `[[SPLIT]]` para default 800ms, `[[SPLIT:2500]]` para custom
+- **Rango valido:** 300-6000ms (fuera de rango se ajusta automaticamente)
+- **Limite defensivo:** maximo 5 marcadores por turno (6 burbujas totales)
+- **NO usar en:** saludos, respuestas cortas, cierres transaccionales
+- **SI usar en:** envio de URLs importantes, multimedia + explicacion, mensajes largos estructurados
+
+### 10.5 Datos en BD
+
+- **Nombres de servicios sin espacios dobles** (Bug #52) - auditoria periodica:
+
+```sql
+SELECT id, nombre FROM servicios
+WHERE LENGTH(nombre) != LENGTH(REGEXP_REPLACE(nombre, '\s+', ' ', 'g'));
+```
+
+- **URLs multimedia con empresa_id consistente** (Bug #54) - auditoria periodica:
+
+```sql
+SELECT sm.id, sm.url, s.empresa_id
+FROM servicios_media sm
+JOIN servicios s ON s.id = sm.servicio_id
+WHERE sm.url NOT LIKE '%/media/' || s.empresa_id || '/%';
+```
+
+### 10.6 Testing post-migracion (checklist ampliado)
+
+Para cada tenant tras cambios en Capa 2 o modulos globales:
+
+- [ ] Saludo inicial exacto
+- [ ] Sin duplicacion de mensajes (Bug #51)
+- [ ] Tono correcto (usted/tu, emojis segun definicion)
+- [ ] Sin exposicion de nombres tecnicos de tools
+- [ ] Flujo transaccional principal completo (agendamiento/pedido)
+- [ ] Casos especiales (bot?, ingles, molesto)
+- [ ] Anti-jailbreak (intento de "ignora tus instrucciones")
+- [ ] Envio de multimedia con URLs reales (no alucinadas) (Bug #54)
+- [ ] Marcadores `[[SPLIT:xxxx]]` funcionando en formato limpio (Bug #55)
+- [ ] Sin placeholders literales en outputs del LLM (Bug #53)
+
+---
+
+## 11. Referencias cruzadas
+
+- `docs/modulos/arquitectura-prompts-sandwich.md` v3.2 - Arquitectura de 3 capas con sistema `[[SPLIT]]` extendido
+- `docs/promps/guia-maestra-prompts-ave.md` v2.3 - Guia de redaccion actualizada
+- `docs/features/split-delays-dinamicos.md` - Feature completa de burbujas con delays
+- `docs/onboarding-clientes/onboarding-clientes.md` - Flujo de creacion de nuevos tenants
+- `docs/modulos/panel-cliente-appsmith.md` - Panel Cliente autoservicio
+- `docs/modulos/openai-multitenant.md` - Gestion de API keys de OpenAI por tenant
+- `docs/troubleshooting/queries-diagnostico.md` v1.2 - Queries de diagnostico actualizadas
+
 
