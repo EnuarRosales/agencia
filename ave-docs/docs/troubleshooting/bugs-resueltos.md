@@ -2617,5 +2617,545 @@ Para cada tenant tras cambios en Capa 2 o modulos globales:
 - `docs/modulos/panel-cliente-appsmith.md` - Panel Cliente autoservicio
 - `docs/modulos/openai-multitenant.md` - Gestion de API keys de OpenAI por tenant
 - `docs/troubleshooting/queries-diagnostico.md` v1.2 - Queries de diagnostico actualizadas
+# Bug 56 - Append para `docs/troubleshooting/bugs-resueltos.md`
 
+**Versión:** append v1.0
+**Fecha:** 2026-07-20
+**Origen:** onboarding inicial de AnaMar (empresa_id=12), primera empresa de la Comunidad 4030
+**Autor:** Enuar Emilio Rosales Salazar
+**Nota:** este bug precede a los bugs 57 y 58 documentados en el mismo día. Se documenta en su
+propio append para preservar la numeración cronológica del descubrimiento.
 
+---
+
+## Bug 56 - Empresa sin filas en `empresa_modulos` produce Capa 1 vacía y bot sin herramientas
+
+### Síntoma observado
+
+Al crear AnaMar (empresa_id=12) e insertar su `bot_config` con `prompt_capa_cliente` completo y
+personalizado, el bot arrancó respondiendo genéricamente y sin cumplir con:
+
+- Consultas a `info_negocio_pg` antes de dar precios
+- Uso de tools de `actualizar_lead_datos`, `actualizar_prioridad_urgente`
+- Flujo de multimedia con `buscar_media_servicio`
+- Reglas de traducción de días y meses al español
+- Comportamiento del módulo PEDIDOS para el cierre de venta
+
+Adicionalmente, la Capa 3 de guardrails universales tampoco tenía efecto. El bot ignoraba la
+personalidad de Ana y respondía con formato genérico.
+
+Todo indicaba que las capas 1 y 3 del sistema sándwich no estaban llegando al agente, pero
+sí la Capa 2 (parcialmente, sin todas las herramientas descritas).
+
+### Diagnóstico
+
+Query que reveló la causa raíz:
+
+```sql
+SELECT em.empresa_id, m.nombre, em.modulo_id, em.activo
+FROM empresa_modulos em
+JOIN modulos_bot m ON m.id = em.modulo_id
+WHERE em.empresa_id = 12;
+-- Resultado: 0 filas
+```
+
+AnaMar no tenía **ningún registro** en `empresa_modulos`. Al crear la empresa se insertó la
+fila en `empresas` y en `bot_config`, pero se olvidó insertar los registros de activación de
+módulos en la tabla `empresa_modulos`.
+
+### Causa raíz
+
+El campo `prompt_modulos_activos` no es una columna almacenada en `bot_config`. Es un campo
+**calculado en runtime** por el nodo `PG_get_empresa` en n8n mediante el siguiente subquery:
+
+```sql
+COALESCE(
+  (SELECT STRING_AGG(m.prompt_bloque, E'\n\n' ORDER BY m.orden)
+   FROM empresa_modulos em
+   JOIN modulos_bot m ON m.id = em.modulo_id
+   WHERE em.empresa_id = e.id
+     AND em.activo = true
+     AND m.activo = true),
+  ''
+) AS prompt_modulos_activos
+```
+
+Cuando no existen filas en `empresa_modulos` para la empresa:
+- El JOIN no devuelve filas.
+- `STRING_AGG` sobre cero filas devuelve `NULL`.
+- El `COALESCE` convierte ese `NULL` en string vacío `''`.
+- El System Message llega al LLM sin Capa 1 (NUCLEO + módulos) y sin Capa 3 (GUARDRAILS).
+
+El bot solo recibe la Capa 2 (`prompt_capa_cliente` de Ana), pero como los ejemplos y flujos
+de Capa 2 asumen que las herramientas globales están descritas en Capa 1 (`buscar_media_servicio`,
+`registrar_pedido`, `actualizar_lead_datos`, etc.), el modelo no sabe que existen y responde
+sin usarlas.
+
+### Solución
+
+Asignar los módulos que corresponden al tipo de tenant. Para AnaMar (dropshipping con
+multimedia y pedidos) los 4 módulos estándar:
+
+```sql
+-- Backup preventivo (aunque la tabla estaba vacía)
+CREATE TABLE backup_empresa_modulos_anamar_20260720 AS
+SELECT * FROM empresa_modulos WHERE empresa_id = 12;
+
+-- Insertar los 4 módulos estándar con modulo_id real (PK)
+INSERT INTO empresa_modulos (empresa_id, modulo_id, activo) VALUES
+  (12, 1, true),   -- NUCLEO
+  (12, 3, true),   -- MEDIOS
+  (12, 4, true),   -- PEDIDOS
+  (12, 5, true);   -- GUARDRAILS
+
+-- Verificar
+SELECT em.empresa_id, m.nombre, em.modulo_id, m.orden, em.activo
+FROM empresa_modulos em
+JOIN modulos_bot m ON m.id = em.modulo_id
+WHERE em.empresa_id = 12
+ORDER BY m.orden;
+```
+
+Resultado esperado: 4 filas con los 4 módulos activos.
+
+### Validación post-fix
+
+Después de insertar los 4 módulos, verificar que la reconstrucción dinámica del System Message
+funciona:
+
+```sql
+SELECT empresa_id,
+       LENGTH(prompt_capa_cliente) AS capa2_chars,
+       LENGTH(prompt_capa_reglas_fin) AS capa3_chars
+FROM bot_config
+WHERE empresa_id = 12;
+```
+
+Y ejecutar el workflow de n8n con un mensaje de prueba para confirmar que el bot ahora:
+- Consulta `info_negocio_pg` antes de responder sobre productos.
+- Usa `buscar_media_servicio` cuando corresponde.
+- Ejecuta el flujo de PEDIDOS correctamente en el cierre.
+
+En el caso de AnaMar, tras aplicar este fix el `prompt_modulos_activos` calculado en runtime
+pasó de 0 a aproximadamente 11.901 caracteres (Capa 1 completa con NUCLEO + MEDIOS + PEDIDOS
++ GUARDRAILS).
+
+### Prevención
+
+Cuatro capas de defensa complementarias:
+
+1. **Regla de onboarding obligatoria:** al crear cualquier empresa, ejecutar en el mismo
+   flujo transaccional el `INSERT` en `empresas`, `bot_config` y `empresa_modulos`. Nunca
+   dejar `empresa_modulos` para después.
+
+2. **Query de auditoría** después de crear cualquier tenant nuevo:
+
+   ```sql
+   SELECT e.id, e.nombre,
+          COUNT(em.modulo_id) AS modulos_asignados,
+          COUNT(em.modulo_id) FILTER (WHERE em.activo = true) AS modulos_activos
+   FROM empresas e
+   LEFT JOIN empresa_modulos em ON em.empresa_id = e.id
+   WHERE e.id = <nuevo_id>
+   GROUP BY e.id, e.nombre;
+   ```
+
+   `modulos_asignados` debe ser >= 3 y `modulos_activos` debe ser >= 3. Si alguno es 0 →
+   detener onboarding e insertar los módulos que correspondan.
+
+3. **Auditoría periódica de tenants huérfanos:**
+
+   ```sql
+   -- Detectar empresas activas sin módulos asignados
+   SELECT e.id, e.nombre
+   FROM empresas e
+   LEFT JOIN empresa_modulos em ON em.empresa_id = e.id
+   WHERE e.activo = true
+   GROUP BY e.id, e.nombre
+   HAVING COUNT(em.modulo_id) = 0;
+   ```
+
+4. **Deuda técnica sistémica:** ver documento aparte `deuda-tecnica-post-anamar.md`,
+   deuda 5 (gestión de módulos activos desde Panel Admin AVE). La UI de administración
+   debería forzar la asignación de módulos como paso obligatorio al crear una empresa.
+
+### Relación con bugs 57 y 58
+
+Los bugs 56, 57 y 58 forman una cadena de descubrimientos en el mismo día de debugging:
+
+```
+Bug 56 (primer síntoma)
+    Empresa sin filas en empresa_modulos
+        ↓
+    Se detecta al principio y se asignan los 4 módulos estándar
+        ↓
+    El bot empieza a usar herramientas pero sigue con formato markdown
+
+Bug 57 (segundo síntoma, descubierto después)
+    prompt_capa_reglas_fin = NULL rompe .replace() en n8n
+        ↓
+    Fix: NULL -> '' explícito
+
+Bug 58 (tercer síntoma, consecuencia acumulada)
+    Memoria contaminada por las respuestas malas anteriores
+        ↓
+    Fix: limpieza selectiva por session_id LIKE '8_%'
+```
+
+Cada uno era un bug real e independiente. Resolver solo el 56 sin descubrir el 57 hubiera
+dejado a AnaMar respondiendo con markdown técnico. Resolver el 57 sin limpiar la memoria
+(bug 58) hubiera dejado al modelo imitando su historial contaminado por horas.
+
+**Orden histórico de descubrimiento y resolución:**
+1. Bug 56 - detectado al arrancar el onboarding, resuelto en ~10 minutos.
+2. Bug 57 - detectado después de ~2 horas de refactorizar el prompt sin efecto, resuelto en ~5 minutos.
+3. Bug 58 - detectado después del fix del 57, resuelto en ~10 minutos con limpieza selectiva.
+
+### Métricas del incidente
+
+- **Tenant afectado:** AnaMar (empresa_id=12)
+- **Tiempo de detección:** ~15 minutos desde primer síntoma (comportamiento genérico del bot)
+- **Tiempo de fix:** 10 minutos (INSERT de 4 filas + verificación)
+- **Empresas en producción afectadas:** 0 (las 4 anteriores fueron migradas con checklist v2
+  que sí incluía la asignación de módulos)
+- **Chars del `prompt_modulos_activos` antes del fix:** 0 (vacío)
+- **Chars del `prompt_modulos_activos` después del fix:** 11901
+
+### Aprendizaje crítico documentado
+
+Este bug reforzó la importancia de entender que **`prompt_modulos_activos` es un campo
+calculado en runtime, no un campo almacenado**. Cualquier cambio en la matriz
+`empresa_modulos × modulos_bot` afecta al comportamiento del bot en el siguiente turno sin
+necesidad de tocar `bot_config`. Es el mecanismo de configuración modular más flexible del
+sistema AVE.
+
+Consecuencia práctica: si un bot deja de usar una herramienta que antes usaba, siempre
+verificar primero `empresa_modulos` antes de tocar el prompt. El "prompt" que ve el LLM es
+más grande que el `prompt_capa_cliente` visible en `bot_config`.
+
+---
+
+## Referencias cruzadas
+
+- `docs/troubleshooting/bugs-resueltos.md` (documento maestro, agregar este bug antes de 57 y 58)
+- `docs/modulos/arquitectura-prompts-sandwich.md` (sección de composición dinámica del prompt)
+- `docs/modulos/aclaracion-ids-modulos.md` (tabla canónica de PKs 1, 2, 3, 4, 5)
+- `docs/onboarding-clientes/checklist-onboarding-v3.md` (Paso 3 previene este bug en futuros
+  onboardings)
+- `docs/backlog/deuda-tecnica-post-anamar.md` (deuda 5 propone UI que previene este bug)
+# Bugs 57-58 - Append para `docs/troubleshooting/bugs-resueltos.md`
+
+**Versión:** append v1.0
+**Fecha:** 2026-07-20
+**Origen:** debugging AnaMar (empresa_id=12)
+**Autor:** Enuar Emilio Rosales Salazar
+**Contexto:** primer onboarding de la Comunidad 4030 post-arquitectura sándwich
+
+---
+
+## Bug 57 - `prompt_capa_reglas_fin = NULL` rompe silenciosamente el System Message en n8n
+
+### Síntoma observado
+
+El bot Ana de AnaMar respondía consistentemente con formato markdown técnico:
+
+```
+Aquí tienes información sobre la resina:
+
+### Imágenes
+1. ![Resina 1](https://api.identechnology.co/ave/media/12/imagenes/54_1784421623047.png)
+2. ![Resina 2](https://api.identechnology.co/ave/media/12/imagenes/54_1784425269063.png)
+
+### Video
+- [Ver video sobre Resina](https://api.identechnology.co/ave/media/12/videos/54_1784425021483.mp4)
+
+Si necesitas más información o deseas realizar un pedido, no dudes en decírmelo.
+```
+
+Ese formato no coincidía con ningún ejemplo del `prompt_capa_cliente` V7 (que había sido reforzado
+con 6 few-shots explícitos de URLs planas). El cliente en Chatwoot y WhatsApp veía texto formateado
+con enlaces en lugar de las imágenes reales.
+
+Se refactorizó el prompt varias veces sin efecto: V4, V5, V6, V7. Siempre reaparecía el mismo
+patrón markdown. Esto llevó a sospechar que el prompt no estaba llegando al agente.
+
+### Causa raíz
+
+La expresión del System Message del nodo `AI_Agent_Principal` en n8n concatena las tres capas de
+la arquitectura sándwich así:
+
+```javascript
+={{
+  $('PG_get_empresa').item.json.prompt_modulos_activos
+    .replace(/{fecha_actual}/g, ...)
+    .replace(/{nombre_empresa}/g, ...)
+    .replace(/{objetivo_bot}/g, ...)
+    .replace(/{tono}/g, ...)
+  + '\n\n' +
+  $('PG_get_empresa').item.json.prompt_capa_cliente
+    .replace(...)
+  + '\n\n' +
+  $('PG_get_empresa').item.json.prompt_capa_reglas_fin
+    .replace(/{nombre_empresa}/g, ...)
+}}
+```
+
+Cuando `prompt_capa_reglas_fin` es `NULL` (como quedó AnaMar al crear la fila sin valor explícito
+en `bot_config`), la invocación `.replace()` sobre `null` lanza:
+
+```
+TypeError: Cannot read properties of null (reading 'replace')
+```
+
+El nodo `AI_Agent_Principal` tiene configurado `onError: continueRegularOutput`, lo que hace que
+el error se trague silenciosamente y el agente responda con un System Message roto o vacío.
+Sin instrucciones, GPT-4o-mini cae en su comportamiento default: formato markdown técnico.
+
+### Diagnóstico decisivo
+
+Query que reveló el problema al comparar los 5 tenants:
+
+```sql
+SELECT empresa_id,
+       prompt_capa_reglas_fin IS NULL AS es_null,
+       LENGTH(COALESCE(prompt_capa_reglas_fin, '')) AS chars
+FROM bot_config
+WHERE empresa_id IN (1, 7, 8, 9, 12)
+ORDER BY empresa_id;
+```
+
+Resultado:
+
+| empresa_id | Empresa    | es_null | chars |
+|------------|------------|---------|-------|
+| 1          | agencIA    | false   | 0     |
+| 7          | Uhane SAS  | false   | 0     |
+| 8          | PC_Outlet  | false   | 0     |
+| 9          | tienda4030 | false   | 0     |
+| **12**     | **AnaMar** | **true**| 0     |
+
+Las 4 empresas en producción tenían `prompt_capa_reglas_fin = ''` (string vacío). AnaMar era la
+única con `NULL`. Ese fue el vector de diferencia decisivo.
+
+### Solución
+
+Fix minimalista y quirúrgico. Cero impacto en las otras empresas:
+
+```sql
+-- Backup preventivo
+CREATE TABLE backup_capa3_anamar_20260720_null_fix AS
+SELECT empresa_id, prompt_capa_reglas_fin, updated_at
+FROM bot_config WHERE empresa_id = 12;
+
+-- Fix
+UPDATE bot_config
+SET prompt_capa_reglas_fin = '',
+    updated_at = NOW()
+WHERE empresa_id = 12
+  AND prompt_capa_reglas_fin IS NULL;
+
+-- Verificación
+SELECT empresa_id,
+       prompt_capa_reglas_fin IS NULL AS sigue_null,
+       LENGTH(prompt_capa_reglas_fin) AS chars
+FROM bot_config
+WHERE empresa_id = 12;
+```
+
+### Prevención
+
+Tres niveles de defensa complementarios:
+
+1. **Regla de onboarding:** al crear cualquier `bot_config`, inicializar
+   `prompt_capa_reglas_fin = ''` explícitamente. Nunca dejarlo `NULL`.
+
+2. **Query de auditoría** después de crear cualquier tenant:
+
+   ```sql
+   SELECT empresa_id,
+          prompt_capa_reglas_fin IS NULL AS capa3_null,
+          prompt_capa_cliente IS NULL   AS capa2_null
+   FROM bot_config
+   WHERE empresa_id = <nuevo_id>;
+   -- Ambos deben ser false. Si alguno es true, corregir con '' antes de activar.
+   ```
+
+3. **Deuda técnica sistémica:** actualizar la expresión del System Message del
+   `AI_Agent_Principal` en n8n para usar `COALESCE` defensivo. Ver documento aparte
+   `deuda-tecnica-coalesce-system-message.md`.
+
+### Métricas del incidente
+
+- **Tenant afectado:** AnaMar (empresa_id=12)
+- **Tiempo de detección:** ~2 horas desde primer síntoma
+- **Tiempo de fix:** 5 minutos desde diagnóstico confirmado
+- **Refactors de prompt intentados antes del diagnóstico:** 4 (V4, V5, V6, V7)
+- **Empresas en producción afectadas:** 0 (todas tenían `''` en Capa 3)
+
+---
+
+## Bug 58 - Memoria contaminada en `n8n_chat_histories` propaga patrones incorrectos
+
+### Síntoma observado
+
+Después de aplicar el fix del bug 57, la primera prueba end-to-end seguía mostrando el mismo
+formato markdown técnico incorrecto. Esto contradecía la hipótesis inicial de que el bug 57 era
+suficiente para resolver el problema.
+
+### Causa raíz
+
+El nodo `Postgres Chat Memory` del `AI_Agent_Principal` está configurado con
+`contextWindowLength: 20`, lo que significa que en cada turno el agente recibe los últimos 20
+mensajes de la conversación (Human + AI + Tool) como parte del contexto.
+
+Durante los múltiples intentos de prueba del bug 57 sin resolver, cada conversación acumuló
+respuestas AI con formato markdown técnico incorrecto:
+
+```sql
+SELECT session_id, id, LEFT(message::text, 200), message->>'type'
+FROM n8n_chat_histories
+WHERE session_id LIKE '8_%'
+ORDER BY id DESC
+LIMIT 20;
+```
+
+Resultado (evidencia real): 5 respuestas consecutivas de tipo `ai` con contenido
+`"Aquí tienes información sobre la resina:\n\n**Imágenes:**\n1. ![Resina 1]..."`.
+
+GPT-4o-mini es un imitador extremadamente fuerte de su propio historial. Cuando recibe 5 ejemplos
+consecutivos de sí mismo respondiendo con markdown, prioriza replicar ese patrón por encima de
+cualquier instrucción del System Message, incluso con few-shots contrarios.
+
+### Solución
+
+Limpieza selectiva de memoria filtrada por `account_id` del tenant (formato de session_id es
+`<account_id>_<conversation_id>`):
+
+```sql
+-- Backup preventivo
+CREATE TABLE backup_chat_memory_anamar_20260720 AS
+SELECT * FROM n8n_chat_histories
+WHERE session_id LIKE '8_%';
+
+-- Limpieza selectiva (account_id de AnaMar en Chatwoot = 8)
+DELETE FROM n8n_chat_histories
+WHERE session_id LIKE '8_%';
+
+-- Verificar aislamiento (no debe tocar otros tenants)
+SELECT
+  SPLIT_PART(session_id, '_', 1) AS account_id,
+  COUNT(*) AS mensajes,
+  COUNT(DISTINCT session_id) AS conversaciones
+FROM n8n_chat_histories
+GROUP BY SPLIT_PART(session_id, '_', 1)
+ORDER BY account_id;
+```
+
+Confirmación de aislamiento post-limpieza (evidencia real):
+
+| account_id | Empresa    | mensajes | conversaciones |
+|------------|------------|----------|----------------|
+| 1          | agencIA    | 752      | 40             |
+| 3          | Uhane SAS  | 1978     | 31             |
+| 4          | PC_Outlet  | 1566     | 54             |
+| 5          | tienda4030 | 874      | 82             |
+
+AnaMar (account_id=8) no aparece porque su memoria quedó vacía. Los demás tenants quedaron
+100 % intactos.
+
+### Prevención
+
+**Regla de oro post-refactor de prompt:** siempre limpiar `n8n_chat_histories` del tenant
+después de cualquier cambio en `prompt_capa_cliente`, `prompt_capa_reglas_fin` o en la
+activación/desactivación de módulos. La memoria contaminada anula el efecto de los cambios.
+
+Query estándar de limpieza:
+
+```sql
+-- Backup obligatorio
+CREATE TABLE backup_chat_memory_<empresa>_<fecha> AS
+SELECT * FROM n8n_chat_histories
+WHERE session_id LIKE '<chatwoot_account_id>_%';
+
+-- Limpieza
+DELETE FROM n8n_chat_histories
+WHERE session_id LIKE '<chatwoot_account_id>_%';
+
+-- Verificar aislamiento
+SELECT SPLIT_PART(session_id, '_', 1) AS account_id,
+       COUNT(*) AS mensajes
+FROM n8n_chat_histories
+GROUP BY SPLIT_PART(session_id, '_', 1)
+ORDER BY account_id;
+```
+
+### Relación con Bug 57
+
+Los bugs 57 y 58 forman una cadena causal:
+
+```
+Bug 57 (CAUSA RAÍZ)
+    prompt_capa_reglas_fin = NULL
+        ↓
+    .replace() lanza TypeError silenciado por onError
+        ↓
+    System Message llega roto/vacío al LLM
+        ↓
+    GPT-4o-mini responde con markdown default
+        ↓
+    Respuesta mala se guarda en n8n_chat_histories
+        ↓
+Bug 58 (CONSECUENCIA)
+    Memoria acumula ejemplos incorrectos
+        ↓
+    Modelo imita su historial por encima del prompt nuevo
+        ↓
+    El fix del bug 57 no surte efecto hasta limpiar memoria
+```
+
+**Orden correcto de resolución:**
+1. Primero fix del bug 57 (raíz).
+2. Después limpieza de memoria (consecuencia acumulada).
+3. Prueba end-to-end con conversación nueva.
+
+Invertir el orden es inútil: limpiar memoria sin arreglar el NULL simplemente permite que la
+memoria se vuelva a contaminar en el siguiente turno.
+
+### Métricas del incidente
+
+- **Mensajes acumulados en memoria antes de limpieza:** ~5 respuestas AI con markdown por conversación
+- **Sesiones afectadas:** session_id 8_25, 8_26, 8_27, 8_28, 8_29
+- **Tenants no afectados en la limpieza:** 4 (agencIA, Uhane, PC_Outlet, tienda4030)
+- **Backups preservados:** `backup_chat_memory_anamar_20260720`,
+  `backup_chat_memory_anamar_post_null_fix_20260720`,
+  `backup_chat_memory_anamar_test_medios_20260720`
+
+---
+
+## Aclaración importante sobre IDs de módulos
+
+Durante el debugging se detectó una confusión histórica entre `modulo_id` (PK) y `orden` en la
+tabla `modulos_bot`. Documentado en detalle en `docs/modulos/aclaracion-ids-modulos.md`.
+
+Referencia rápida para queries sobre `empresa_modulos`:
+
+| Módulo     | modulo_id (PK) | orden |
+|------------|----------------|-------|
+| NUCLEO     | 1              | 10    |
+| MEDIOS     | 3              | 30    |
+| PEDIDOS    | 4              | 40    |
+| GUARDRAILS | 5              | 100   |
+
+**Todo UPDATE/JOIN sobre `empresa_modulos` debe usar `modulo_id` con los valores 1, 3, 4, 5.**
+Los valores 10, 30, 40, 100 son solo para el `ORDER BY m.orden` dentro del `STRING_AGG` que
+arma `prompt_modulos_activos` en `PG_get_empresa`.
+
+---
+
+## Referencias cruzadas
+
+- `docs/troubleshooting/bugs-resueltos.md` (documento maestro, agregar estos bugs)
+- `docs/modulos/arquitectura-prompts-sandwich.md` (sección de guardrails y Capa 3)
+- `docs/modulos/aclaracion-ids-modulos.md` (nuevo, ver documento aparte)
+- `docs/onboarding-clientes/onboarding-clientes.md` (actualizar checklist con paso Capa 3)
+- `docs/promps/guia-maestra-prompts-ave.md` (actualizar sección de operativa segura)
